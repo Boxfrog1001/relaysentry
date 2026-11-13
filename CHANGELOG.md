@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.4] - 2026-11-13
+### Fixed (Final Pre-Public Beta Stabilization)
+- **Linux `0C` (`TCP_NEW_SYN_RECV`) half-open SYN flood decoding (`src/telemetry_procfs.py`):** Included state `0C` alongside `01`/`02`/`03` (and added host-endianness guard + dead duplicate helper cleanup) so modern Linux kernels (`4.4+`) reporting half-open inbound SYN backlog sockets as `0C` are accurately counted rather than skipped.
+- **Overload-stride `NONRELAY_PEER_FLOOD` floor consistency (`src/correlator.py`):** Unified `threshold_count`, `heavy_relays`, and `heavy_nonrelays` on `_stride_eligible_count()` so masked `1–2` sample peers under `1-in-16` stride sampling never trigger false `NONRELAY_PEER_FLOOD` signals.
+- **XDP retired-relay pruning & nftables ban chunking (`src/shield_engine.py`, `src/relaysentry.py`):** Extended `generate_xdp_map_sync()` and `ShieldController` with transactional `remove_allow_ips` pruning when relays leave Tor Consensus during `--watch`, added `stderr` warnings when wider `--allow-cidr` prefixes are passed with XDP backends, chunked live `nft` ban `add element` batches at `256` entries, and emitted single-command atomic `nft '...'` rules in `--emit-nft-hints`.
+- **CLI validation & error exits (`src/relaysentry.py`, `test/verify_relaysentry.py`):** Routed invalid numeric/port flags through `parser.error()`, caught `ControlPort` `PermissionError` cleanly at exit `2` without tracebacks, updated `--consensus-file` help text, and added `[TEST 12]` regression coverage (`12/12` suites).
+
 ## [0.3.3] - 2026-11-13
 ### Fixed & Clarified (Public Beta Freeze)
 - **`--watch` Tick-1 `MetricsPort` baseline (`src/relaysentry.py`, `test/verify_relaysentry.py`):** Baselined cumulative Tor `MetricsPort` counters on the first successful `--watch` scrape instead of treating process-lifetime historical drops/OOM totals as an immediate Tick-1 interval spike; added `[TEST 11]` multi-tick regression test.

@@ -143,11 +143,11 @@ def generate_kernel_nft_rules(
             continue
         proto = "ip6 saddr" if addr.version == 6 else "ip saddr"
         port_expr = ", ".join(str(p) for p in valid_ports)
-        # Self-contained per-IP rate-limit hint (does not require pre-existing inet raw/filter tables).
+        # Single atomic nft command so prepending one `sudo` works cleanly without unprivileged `&&`.
         hints.append(
-            f"nft add table inet relaysentry_hints && "
-            f"nft 'add chain inet relaysentry_hints input {{ type filter hook input priority filter; policy accept; }}' && "
-            f"nft 'add rule inet relaysentry_hints input {proto} {addr.compressed} "
+            f"nft 'add table inet relaysentry_hints; "
+            f"add chain inet relaysentry_hints input {{ type filter hook input priority filter; policy accept; }}; "
+            f"add rule inet relaysentry_hints input {proto} {addr.compressed} "
             f"tcp dport {{ {port_expr} }} ct state new limit rate over {rate_limit} burst {burst} packets drop'  # review TTL={ttl_seconds}s"
         )
     return hints
@@ -267,6 +267,18 @@ def kernel_supports_nft_connlimit(nft_bin: str | None = None) -> bool:
         except OSError:
             return False
     return True
+
+
+def _append_nft_elements(
+    lines: list[str],
+    set_name: str,
+    elements: list[str],
+    chunk_size: int = 256,
+) -> None:
+    """Append bounded `add element inet relaysentry_shield <set>` batches."""
+    for idx in range(0, len(elements), chunk_size):
+        chunk = ", ".join(elements[idx : idx + chunk_size])
+        lines.append(f"add element inet relaysentry_shield {set_name} {{ {chunk} }}")
 
 
 def generate_nft_consensus_sync(
@@ -433,19 +445,10 @@ def generate_nft_consensus_sync(
             "flush set inet relaysentry_shield known_relays6",
         ]
     )
-    chunk_size = 256
-    for idx in range(0, len(allow_v4_sorted), chunk_size):
-        chunk = ", ".join(allow_v4_sorted[idx : idx + chunk_size])
-        lines.append(f"add element inet relaysentry_shield allow_net4 {{ {chunk} }}")
-    for idx in range(0, len(allow_v6_sorted), chunk_size):
-        chunk = ", ".join(allow_v6_sorted[idx : idx + chunk_size])
-        lines.append(f"add element inet relaysentry_shield allow_net6 {{ {chunk} }}")
-    for idx in range(0, len(v4_sorted), chunk_size):
-        chunk = ", ".join(v4_sorted[idx : idx + chunk_size])
-        lines.append(f"add element inet relaysentry_shield known_relays4 {{ {chunk} }}")
-    for idx in range(0, len(v6_sorted), chunk_size):
-        chunk = ", ".join(v6_sorted[idx : idx + chunk_size])
-        lines.append(f"add element inet relaysentry_shield known_relays6 {{ {chunk} }}")
+    _append_nft_elements(lines, "allow_net4", allow_v4_sorted)
+    _append_nft_elements(lines, "allow_net6", allow_v6_sorted)
+    _append_nft_elements(lines, "known_relays4", v4_sorted)
+    _append_nft_elements(lines, "known_relays6", v6_sorted)
     return "\n".join(lines)
 
 
@@ -466,6 +469,7 @@ def generate_xdp_map_sync(
     blocked_ips: Iterable[str] = (),
     pin_dir: str = "/sys/fs/bpf/relaysentry",
     unblock_ips: Iterable[str] = (),
+    remove_allow_ips: Iterable[str] = (),
 ) -> str:
     """Emit a bpftool batch script syncing allow_relay_v4/6 and blocked_v4/6 maps."""
     safe_dir = _validate_pin_dir(pin_dir)
@@ -495,6 +499,18 @@ def generate_xdp_map_sync(
     for addr6 in sorted(set(v6_allow), key=lambda a: int(a)):
         lines.append(
             f"map update pinned {safe_dir}/allow_relay_v6 key hex {_format_hex_bytes(addr6.packed)} value hex 01 any"
+        )
+
+    for raw_ip in sorted(set(remove_allow_ips)):
+        try:
+            addr = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            continue
+        if addr.compressed in allow_set:
+            continue
+        mname = "allow_relay_v4" if addr.version == 4 else "allow_relay_v6"
+        lines.append(
+            f"map delete pinned {safe_dir}/{mname} key hex {_format_hex_bytes(addr.packed)}"
         )
 
     zero_u64 = "00 00 00 00 00 00 00 00"
@@ -907,7 +923,17 @@ class ShieldController:
             for cidr in allow_cidrs
             if cidr and cidr.strip()
         )
+        if self.backend == "xdp":
+            for net in self.allow_networks:
+                if net.prefixlen != net.max_prefixlen:
+                    print(
+                        f"[WARN] XDP allow_relay maps support /32 and /128 host entries only; "
+                        f"wider --allow-cidr {net.compressed} stays protected from blocked_v4/6 bans "
+                        f"but remains subject to XDP SYN token-bucket limits (use --shield-backend nft for CIDR bypass).",
+                        file=sys.stderr,
+                    )
         self.active_bans: dict[str, float] = {}
+        self._synced_xdp_allow_ips: set[str] = set()
         self._last_consensus_sync: float | None = None
         self._had_non_normal: bool = False
         self.last_summary: ShieldEnforcementSummary | None = None
@@ -976,6 +1002,7 @@ class ShieldController:
         consensus_synced = False
         new_sync_ts = self._last_consensus_sync
 
+        new_synced_xdp_allow = self._synced_xdp_allow_ips
         if self._last_consensus_sync is None or (now - self._last_consensus_sync) >= self.consensus_sync_interval:
             if self.backend == "nft":
                 chunk = generate_nft_consensus_sync(
@@ -991,7 +1018,13 @@ class ShieldController:
                 for net in self.allow_networks:
                     if net.prefixlen == net.max_prefixlen:
                         xdp_allow.add(net.network_address.compressed)
-                chunk = generate_xdp_map_sync(xdp_allow, pin_dir=self.bpf_pin_dir)
+                removed_allow = self._synced_xdp_allow_ips - xdp_allow
+                chunk = generate_xdp_map_sync(
+                    xdp_allow,
+                    pin_dir=self.bpf_pin_dir,
+                    remove_allow_ips=removed_allow,
+                )
+                new_synced_xdp_allow = xdp_allow
             payload_chunks.append(chunk)
             new_sync_ts = now
             consensus_synced = True
@@ -1060,11 +1093,9 @@ class ShieldController:
                         else:
                             v4_emit.append(f"{ip} timeout {rem}s")
                 if v4_emit:
-                    elems4 = ", ".join(v4_emit)
-                    payload_chunks.append(f"add element inet relaysentry_shield tor_ddos4 {{ {elems4} }}")
+                    _append_nft_elements(payload_chunks, "tor_ddos4", v4_emit)
                 if v6_emit:
-                    elems6 = ", ".join(v6_emit)
-                    payload_chunks.append(f"add element inet relaysentry_shield tor_ddos6 {{ {elems6} }}")
+                    _append_nft_elements(payload_chunks, "tor_ddos6", v6_emit)
             elif added_bans:
                 payload_chunks.append(
                     generate_xdp_map_sync((), blocked_ips=added_bans, pin_dir=self.bpf_pin_dir)
@@ -1072,6 +1103,7 @@ class ShieldController:
 
         combined_payload = "\n".join(c for c in payload_chunks if c.strip())
         self._apply(combined_payload)
+        self._synced_xdp_allow_ips = new_synced_xdp_allow
         self._last_consensus_sync = new_sync_ts
         self.active_bans = staged_bans
 

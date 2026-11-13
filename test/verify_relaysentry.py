@@ -35,6 +35,7 @@ from shield_engine import (
     TelemetryRingBuffer,
     classify_flood_shape,
     compute_shannon_entropy,
+    generate_kernel_nft_rules,
     generate_nft_consensus_sync,
     generate_xdp_map_sync,
     render_xdp_shield_c,
@@ -635,6 +636,7 @@ def test_adaptive_shield_xdp_entropy_and_stride() -> None:
     # Honest single sampled client at index 96 MUST stay masked even though 1*16 >= 10!
     assert "192.0.2.44" not in labels
     assert sum(1 for p in rep.nonrelay_peers if p.masked) == 1
+    assert any("NONRELAY_PEER_FLOOD (1 peers >= 10 sockets)" in r for r in rep.reasons)
     for j in range(5):
         ring.push(ring.snapshot()[-1])
     assert len(ring.snapshot()) == 3
@@ -1159,6 +1161,141 @@ def test_watch_metrics_tick1_baseline() -> None:
     print("  [PASS] --watch Tick-1 MetricsPort cumulative counter baselining verified.")
 
 
+def test_new_syn_recv_stride_xdp_prune_and_cli_validation() -> None:
+    print("[TEST 12] Verifying 0C NEW_SYN_RECV, stride alert floor, XDP relay prune & CLI validation...")
+    # 1. Linux 4.4+ /proc/net/tcp state 0C (TCP_NEW_SYN_RECV) must count as half-open SYN backlog
+    syn_0c_lines = [
+        f" {i:3d}: {_encode_ipv4_hex_le('192.0.2.5')}:2329 "
+        f"{_encode_ipv4_hex_le('198.51.100.99')}:{43000 + i:04X} 0C 00000000:00000000 00:00000000 0 105 0 {700 + i}"
+        for i in range(55)
+    ]
+    parsed_0c, _ = parse_proc_net_tcp_lines_bounded(syn_0c_lines, {9001})
+    assert len(parsed_0c) == 55 and all(s.state == "NEW_SYN_RECV" for s in parsed_0c)
+    rep_0c = correlate_triage(
+        sockets=parsed_0c,
+        consensus=ConsensusIndex({}, {}),
+        vault=EphemeralPrivacyVault(reveal_flooders=False, flood_threshold=25),
+        flood_threshold=25,
+    )
+    assert rep_0c.total_syn_recv == 55
+    assert rep_0c.severity == "ACTIVE_DOS_PRESSURE"
+    assert any("HIGH_SYN_RECV_BACKLOG (55" in r for r in rep_0c.reasons)
+
+    # 2. Stride=16 with 2 raw samples (2 * 16 = 32 >= 25) MUST NOT reveal, ban, or fire NONRELAY_PEER_FLOOD
+    two_raw_lines = [
+        f" {i:3d}: {_encode_ipv4_hex_le('192.0.2.5')}:2329 "
+        f"{_encode_ipv4_hex_le('192.0.2.88')}:{44000 + i:04X} 01 00000000:00000000 00:00000000 0 105 0 {800 + i}"
+        for i in range(2)
+    ]
+    two_socks = parse_proc_net_tcp_lines(two_raw_lines, {9001})
+    rep_stride_floor = correlate_triage(
+        sockets=two_socks,
+        consensus=ConsensusIndex({}, {}),
+        vault=EphemeralPrivacyVault(reveal_flooders=True, flood_threshold=25),
+        flood_threshold=25,
+        sample_stride=16,
+    )
+    assert rep_stride_floor.nonrelay_peers[0].masked is True
+    assert rep_stride_floor.heavy_nonrelay_ips == ()
+    assert not any("NONRELAY_PEER_FLOOD" in r for r in rep_stride_floor.reasons)
+
+    # 3. XDP ShieldController update_consensus prunes retired relays & keeps transactional rollback
+    xdp_cmds: list[str] = []
+    fail_next = False
+
+    def _mock_xdp_runner(_argv: list[str], payload: str) -> None:
+        if fail_next:
+            raise subprocess.CalledProcessError(1, "bpftool")
+        xdp_cmds.append(payload)
+
+    prune_ctrl = ShieldController(
+        ports={9001},
+        consensus_ips=["192.0.2.10", "192.0.2.11"],
+        backend="auto",
+        dry_run=False,
+        command_runner=_mock_xdp_runner,
+        backend_detector=lambda: "xdp",
+    )
+    prune_ctrl.reconcile("NORMAL", [], now_monotonic=10.0)
+    assert "allow_relay_v4 key hex c0 00 02 0b value hex 01 any" in xdp_cmds[-1]
+    prune_ctrl.update_consensus(["192.0.2.10"])
+    fail_next = True
+    failed_prune = False
+    try:
+        prune_ctrl.reconcile("NORMAL", [], now_monotonic=20.0)
+    except subprocess.CalledProcessError:
+        failed_prune = True
+    assert failed_prune and "192.0.2.11" in prune_ctrl._synced_xdp_allow_ips
+    fail_next = False
+    prune_ctrl.reconcile("NORMAL", [], now_monotonic=30.0)
+    assert "map delete pinned /sys/fs/bpf/relaysentry/allow_relay_v4 key hex c0 00 02 0b" in xdp_cmds[-1]
+    assert "192.0.2.11" not in prune_ctrl._synced_xdp_allow_ips
+
+    # 4. Single atomic nft hint syntax + wider --allow-cidr XDP warning + clean CLI errors
+    hints = generate_kernel_nft_rules([("198.51.100.55", (9001,))])
+    assert len(hints) == 1 and "&& nft" not in hints[0]
+    assert hints[0].startswith("nft 'add table inet relaysentry_hints; ")
+
+    with tempfile.TemporaryDirectory() as td:
+        cons_file = Path(td) / "cons.json"
+        cons_file.write_text(json.dumps({"relays": []}), encoding="utf-8")
+        proc_file = Path(td) / "tcp"
+        proc_file.write_text("  sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n")
+        warn_err = io.StringIO()
+        out_buf = io.StringIO()
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(warn_err):
+            rc_xdp = cli_main(
+                [
+                    "--port",
+                    "9001",
+                    "--consensus-file",
+                    str(cons_file),
+                    "--offline",
+                    "--no-cache",
+                    "--allow-cidr",
+                    "198.51.100.0/24",
+                    "--emit-xdp-sync",
+                ]
+            )
+        assert rc_xdp == 0
+        assert "skipping wider --allow-cidr 198.51.100.0/24" in warn_err.getvalue()
+
+        for bad_argv in (
+            ["--port", "9001", "--flood-threshold", "1"],
+            ["--port", "9001", "--watch", "-1"],
+            ["--port", "99999"],
+        ):
+            err_buf = io.StringIO()
+            exited_rc = None
+            with contextlib.redirect_stderr(err_buf):
+                try:
+                    cli_main(bad_argv)
+                except SystemExit as exc:
+                    exited_rc = exc.code
+            assert exited_rc == 2, f"Expected clean exit 2 for {bad_argv}, got {exited_rc}"
+
+        perm_err = io.StringIO()
+        with mock.patch("relaysentry.query_control_orconn", side_effect=PermissionError("ControlPort AUTHENTICATE failed")):
+            with contextlib.redirect_stderr(perm_err):
+                perm_rc = cli_main(
+                    [
+                        "--port",
+                        "9001",
+                        "--consensus-file",
+                        str(cons_file),
+                        "--proc-tcp-file",
+                        str(proc_file),
+                        "--control-port",
+                        "9051",
+                        "--offline",
+                        "--no-cache",
+                    ]
+                )
+        assert perm_rc == 2 and "ControlPort AUTHENTICATE failed" in perm_err.getvalue()
+
+    print("  [PASS] 0C NEW_SYN_RECV, stride alert floor, XDP prune, single nft hints & CLI exits verified.")
+
+
 def main() -> int:
     print("=" * 74)
     print(" RELAYSENTRY PRIVACY, SPECIFICATION & SANDBOX VERIFICATION SUITE")
@@ -1174,8 +1311,9 @@ def main() -> int:
     test_thunderstorm_and_unresponsive_metrics_resilience()
     test_builtin_shield_controller_and_xdp_sync()
     test_watch_metrics_tick1_baseline()
+    test_new_syn_recv_stride_xdp_prune_and_cli_validation()
     print("=" * 74)
-    print(" ALL 11 RELAYSENTRY BENCHMARK & PRIVACY SUITES PASSED (0 FAILURES)")
+    print(" ALL 12 RELAYSENTRY BENCHMARK & PRIVACY SUITES PASSED (0 FAILURES)")
     print("=" * 74)
     return 0
 

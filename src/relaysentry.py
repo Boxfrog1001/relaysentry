@@ -260,7 +260,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--control-host", default="127.0.0.1", help="Tor ControlPort host (default: 127.0.0.1)")
     p.add_argument("--control-port", type=int, help="Tor ControlPort TCP port (e.g. 9051)")
     p.add_argument("--control-cookie", type=Path, help="Path to Tor 32-byte control_auth_cookie")
-    p.add_argument("--consensus-file", type=Path, help="Path to local Onionoo details JSON file")
+    p.add_argument(
+        "--consensus-file",
+        type=Path,
+        help="Path to local Onionoo details JSON or Tor v3 cached-consensus / cached-microdesc-consensus file",
+    )
     p.add_argument("--proc-tcp-file", type=Path, help="Optional fixture /proc/net/tcp file for offline replay")
     p.add_argument("--proc-tcp6-file", type=Path, help="Optional fixture /proc/net/tcp6 file for offline replay")
     p.add_argument("--no-cache", action="store_true", help="Do not write Onionoo cache files to disk (RAM-only)")
@@ -493,17 +497,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.watch < 0:
-        raise ValueError("--watch interval must be >= 0")
+        parser.error("--watch interval must be >= 0")
     if args.hysteresis_seconds < 0:
-        raise ValueError("--hysteresis-seconds must be >= 0")
+        parser.error("--hysteresis-seconds must be >= 0")
     if args.max_exact_sockets < 0:
-        raise ValueError("--max-exact-sockets must be >= 0")
+        parser.error("--max-exact-sockets must be >= 0")
     if args.metrics_timeout <= 0:
-        raise ValueError("--metrics-timeout must be > 0")
+        parser.error("--metrics-timeout must be > 0")
     if args.ban_ttl <= 0:
-        raise ValueError("--ban-ttl must be > 0")
+        parser.error("--ban-ttl must be > 0")
+    if args.flood_threshold < 2:
+        parser.error("--flood-threshold must be >= 2 to prevent single-client disclosure")
 
-    ports = _validate_ports(args.port)
+    try:
+        ports = _validate_ports(args.port)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.emit_xdp_c:
         _safe_stdout(render_xdp_shield_c(ports))
         return 0
@@ -563,6 +572,12 @@ def main(argv: list[str] | None = None) -> int:
                 net = ipaddress.ip_network(raw_cidr.strip(), strict=False)
                 if net.prefixlen == net.max_prefixlen:
                     xdp_allow.add(net.network_address.compressed)
+                else:
+                    print(
+                        f"[WARN] XDP allow_relay maps support /32 and /128 host entries only; "
+                        f"skipping wider --allow-cidr {net.compressed} in --emit-xdp-sync.",
+                        file=sys.stderr,
+                    )
             except ValueError as exc:
                 print(f"[ERROR] Invalid --allow-cidr {raw_cidr!r}: {exc}", file=sys.stderr)
                 return 2
@@ -626,16 +641,20 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     last_consensus_refresh = now_tick - (DEFAULT_CACHE_TTL_SECONDS - 300)
 
-            report, prev_metrics = run_once(
-                ports,
-                consensus,
-                vault,
-                args,
-                prev_metrics,
-                state_machine=state_machine,
-                ring_buffer=ring_buffer,
-                shield_controller=shield_controller,
-            )
+            try:
+                report, prev_metrics = run_once(
+                    ports,
+                    consensus,
+                    vault,
+                    args,
+                    prev_metrics,
+                    state_machine=state_machine,
+                    ring_buffer=ring_buffer,
+                    shield_controller=shield_controller,
+                )
+            except PermissionError as exc:
+                print(f"[ERROR] {exc}", file=sys.stderr)
+                return 2
             shield_summary = shield_controller.last_summary if shield_controller is not None else None
             out_text = (
                 json.dumps(_report_to_dict(report, shield_status=shield_summary, vault=vault), indent=2)

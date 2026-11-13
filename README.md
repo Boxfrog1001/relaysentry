@@ -24,7 +24,7 @@ When a Tor relay hits overload (`dropped ntor onionskins`, OOM invocations, or s
 
 ## Features
 
-* **Zero-Subprocess Kernel Socket Telemetry & Overload Stride:** Reads `/proc/net/tcp` and `/proc/net/tcp6` directly in pure Python (64 MiB read cap), tracking active `ESTABLISHED`, `SYN_SENT`, and `SYN_RECV` sockets (excluding `LISTEN`, `TIME_WAIT`, and closing states) and `rx_queue`/`tx_queue` byte depths, with automatic `1-in-16` stride sampling above `--max-exact-sockets` (`50000`) and a minimum raw sample floor so low-socket clients are never misattributed under overload.
+* **Zero-Subprocess Kernel Socket Telemetry & Overload Stride:** Reads `/proc/net/tcp` and `/proc/net/tcp6` directly in pure Python (64 MiB read cap), tracking active `ESTABLISHED`, `SYN_SENT`, `SYN_RECV`, and `NEW_SYN_RECV` sockets (excluding `LISTEN`, `TIME_WAIT`, and closing states) and `rx_queue`/`tx_queue` byte depths, with automatic `1-in-16` stride sampling above `--max-exact-sockets` (`50000`) and a minimum raw sample floor so low-socket clients are never misattributed under overload.
 * **Built-In Adaptive Shield Engine & Active Enforcement (`--enforce-shield`, Experimental Beta):** Combines a 3-state attack hysteresis hold (`--hysteresis-seconds`), anonymized HMAC-bucket Shannon entropy flood-shape classification (`CONCENTRATED_SOURCE` vs `DISTRIBUTED_BOTNET`), bounded 64-tick ring history, `torrc` `DoSBeginDir*` / Equi-X PoW & kernel `sk_buff` (`net.core.high_order_alloc_disable=1`) guidance, atomic per-IP dual-stack consensus-safe `nftables` (`--emit-nft-consensus`), `bpftool` XDP map sync (`--emit-xdp-sync`), and a compilable dual-stack `eBPF/XDP` SYN token-bucket shield (`--emit-xdp-c`). When started with `--enforce-shield --watch`, `ShieldController` refreshes Consensus allowlists periodically, blocks verified high-socket flooders (`--ban-ttl`, strictly skipping Consensus relays, loopback, and `--allow-cidr` — full CIDRs in `nft` interval sets and `/32`/`/128` hosts in XDP maps), and flushes temporary bans on recovery (`--shield-dry-run` evaluates logic locally without requiring root or invoking `nft`/`bpftool`).
 * **Tor `MetricsPort` & Thunderstorm Integration:** Parses official Prometheus counters (`tor_relay_connections`, `tor_relay_load_onionskins_total`, `tor_relay_load_oom_bytes_total`, `tor_relay_load_socket_total`, `tor_relay_load_tcp_exhaustion*`, `tor_relay_dos_total{type="begindir_*|circuit_*|conn_rejected"}`, and `tor_relay_streams_total{cmd="BEGIN_DIR"}`) with non-crashing timeout resilience (`--metrics-timeout` -> `METRICS_PORT_UNRESPONSIVE`) and half-open `BEGIN_DIR` event-loop stall detection (`HALF_OPEN_BEGIN_DIR_BYPASS_SUSPECTED`). Continuous `--watch` runs automatically baseline cumulative counters on Tick 1 so alerts reflect real interval deltas from Tick 2 onward (one-shot invocations inspect lifetime daemon totals).
 * **Tor `ControlPort` Cross-Check:** Supports bounded 32-byte cookie authentication (`--control-cookie` / `--control-port`) to fetch `GETINFO orconn-status` and correlate live peer OR circuits.
@@ -100,7 +100,7 @@ sudo ./bin/relaysentry --port 9001 --port 9030 --enforce-shield --shield-backend
 
 ---
 
-## Status: Experimental Beta (`0.3.3-beta`) & Where Help Is Needed
+## Status: Experimental Beta (`0.3.4-beta`) & Where Help Is Needed
 
 `RelaySentry` is currently verified in offline unit/sandbox tests and local Linux `6.6` network-namespace runs against a 6-node offline Chutney `basic-min` network (`Tor 0.4.9.11`). Treat active kernel/XDP mitigation (`--enforce-shield`, `--emit-xdp-c`) as **experimental beta** until tested more broadly on live multi-Gbps relays.
 
@@ -123,5 +123,5 @@ sudo ./bin/relaysentry --port 9001 --port 9030 --enforce-shield --shield-backend
 * [`src/shield_engine.py`](src/shield_engine.py) — Hysteresis, entropy flood classifier, consensus `nft` allowlist, `torrc` PoW & XDP/eBPF C shield
 * [`doc/THREAT_MODEL_AND_SPECS.md`](doc/THREAT_MODEL_AND_SPECS.md) — Architectural & Tor specification ground truth
 * [`doc/ENGINEERING_STORY.md`](doc/ENGINEERING_STORY.md) — Build, Thunderstorm reconstruction, hostile audits & live Chutney/kernel story
-* [`test/verify_relaysentry.py`](test/verify_relaysentry.py) — 11-suite offline + loopback sandbox testbench
+* [`test/verify_relaysentry.py`](test/verify_relaysentry.py) — 12-suite offline + loopback sandbox testbench
 * [`test/simulate_thunderstorm.py`](test/simulate_thunderstorm.py) — 4-stage live Thunderstorm & half-open bypass simulator

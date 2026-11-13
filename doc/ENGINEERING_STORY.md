@@ -1,4 +1,4 @@
-# Engineering Story: Building, Breaking, and Hardening RelaySentry (`v0.1.0` -> `v0.3.3-beta`)
+# Engineering Story: Building, Breaking, and Hardening RelaySentry (`v0.1.0` -> `v0.3.4-beta`)
 
 ## Why We Built This
 
@@ -78,6 +78,6 @@ Static and hostile audits catch logic bugs, **live kernel toolchains and real To
 
 ## Stage 6 — `v0.3.3-beta` Scope Freeze & Public Beta Release
 
-Rather than adding further unverified features, `v0.3.3-beta` freezes feature scope cleanly to prepare RelaySentry for real community operator testing: fixed the `--watch` Tick-1 `MetricsPort` cumulative counter false-alarm bug (establishing a baseline on Tick 1 so historical daemon counters do not trigger `ACTIVE_DOS_PRESSURE` on startup), synchronized `SECURITY.md` and `doc/THREAT_MODEL_AND_SPECS.md` with actual kernel/procfs/shield invariants, and documented the remaining production gaps (`BPF_MAP_TYPE_LPM_TRIE` CIDR XDP allowlists, native hardware NIC XDP validation, live IPv6 E2E traffic tests, and systemd/`debian-tor` packaging) openly in `README.md`.
+Rather than adding further unverified features, `v0.3.3-beta` -> `v0.3.4-beta` freezes feature scope cleanly to prepare RelaySentry for real community operator testing: fixed the `--watch` Tick-1 `MetricsPort` cumulative counter false-alarm bug, preserved Linux 4.4+ `/proc/net/tcp[6]` state `0C` (`TCP_NEW_SYN_RECV`) half-open SYN backlog tracking, aligned `NONRELAY_PEER_FLOOD` alerting with the `1-in-16` stride raw sample privacy floor, added transactional retired-relay pruning for XDP `allow_relay_v4/6` maps, hardened CLI validation (`parser.error` + clean `PermissionError` exit), synchronized `SECURITY.md` and `doc/THREAT_MODEL_AND_SPECS.md` with actual kernel/procfs/shield invariants, and documented the remaining production gaps (`BPF_MAP_TYPE_LPM_TRIE` CIDR XDP allowlists, native hardware NIC XDP validation, live IPv6 E2E traffic tests, and systemd/`debian-tor` packaging) openly in `README.md`.
 
 **Practical takeaway:** `RelaySentry` isn't a replacement for upstream Tor C fixes—it's a hardened, battle-audited beta shield and forensic triage bridge designed to keep real relay operators online safely until upstream Tor mitigations land across the network.

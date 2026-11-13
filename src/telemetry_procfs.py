@@ -7,6 +7,7 @@ ORPort and DirPort endpoints without shelling out to external binaries.
 
 import ipaddress
 import re
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,54 +57,18 @@ def decode_proc_addr(token: str) -> tuple[str, int] | None:
     port = int(hex_port, 16)
     raw = bytes.fromhex(hex_ip)
     if len(raw) == 4:
-        # /proc/net/tcp stores IPv4 as host-endian 32-bit u32 on x86/ARM Linux.
-        addr: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.IPv4Address(raw[::-1])
+        # /proc/net/tcp stores IPv4 as host-endian 32-bit u32 on Linux.
+        be4 = raw[::-1] if sys.byteorder == "little" else raw
+        addr: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.IPv4Address(be4)
     else:
         # /proc/net/tcp6 stores 4 consecutive 32-bit host-endian words.
-        be_bytes = b"".join(raw[i : i + 4][::-1] for i in range(0, 16, 4))
+        if sys.byteorder == "little":
+            be_bytes = b"".join(raw[i : i + 4][::-1] for i in range(0, 16, 4))
+        else:
+            be_bytes = raw
         v6 = ipaddress.IPv6Address(be_bytes)
         addr = v6.ipv4_mapped if v6.ipv4_mapped is not None else v6
     return addr.compressed, port
-
-
-def _decode_socket_line(
-    line: str,
-    monitored_ports: set[int],
-    include_listen: bool,
-) -> SocketEntry | None:
-    """Decode one /proc/net/tcp[6] line into SocketEntry if it matches monitored_ports."""
-    parts = line.split()
-    if len(parts) < 8 or parts[0] == "sl":
-        return None
-    local = decode_proc_addr(parts[1])
-    remote = decode_proc_addr(parts[2])
-    if local is None or remote is None:
-        return None
-    local_ip, local_port = local
-    remote_ip, remote_port = remote
-    if local_port not in monitored_ports:
-        return None
-    st_code = parts[3].upper()
-    state = TCP_STATES.get(st_code, f"STATE_{st_code}")
-    if not include_listen and state == "LISTEN":
-        return None
-    q_match = HEX_PAIR_RE.match(parts[4])
-    tx_q = int(q_match.group(1), 16) if q_match else 0
-    rx_q = int(q_match.group(2), 16) if q_match else 0
-    try:
-        uid = int(parts[7])
-    except ValueError:
-        uid = -1
-    return SocketEntry(
-        local_ip=local_ip,
-        local_port=local_port,
-        remote_ip=remote_ip,
-        remote_port=remote_port,
-        state=state,
-        tx_queue=tx_q,
-        rx_queue=rx_q,
-        uid=uid,
-    )
 
 
 def parse_proc_net_tcp_lines_bounded(
@@ -124,11 +89,12 @@ def parse_proc_net_tcp_lines_bounded(
         if len(parts) < 8 or parts[0] == "sl":
             continue
         st_code = parts[3].upper()
-        # Exclude LISTEN (0A) unless requested, and always exclude TIME_WAIT / closing states.
+        # Exclude LISTEN (0A) unless requested and always exclude TIME_WAIT / closing states.
+        # Include 0C (TCP_NEW_SYN_RECV), used by Linux 4.4+ for half-open SYN_RECV request sockets.
         if st_code == "0A":
             if not include_listen:
                 continue
-        elif st_code not in ("01", "02", "03"):
+        elif st_code not in ("01", "02", "03", "0C"):
             continue
         try:
             _, port_hex = parts[1].rsplit(":", 1)

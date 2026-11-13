@@ -143,6 +143,16 @@ def _family_cluster_key(meta: RelayMeta) -> tuple[str, str]:
     return f"{meta.as_number}:{meta.primary_ipv4_24}", "asn_subnet24"
 
 
+def _stride_eligible_count(raw_sockets: int, stride: int, flood_threshold: int) -> int:
+    """Scale sampled socket count only after meeting the anti-noise raw sample floor."""
+    est = raw_sockets * stride
+    if stride == 1:
+        return est
+    # Under 1-in-N overload sampling, require >= 3 raw samples so 1-2 socket clients never reveal/ban/alert.
+    min_stride_samples = max(3, (flood_threshold // stride) + 1)
+    return est if raw_sockets >= min_stride_samples else 0
+
+
 def compute_metrics_delta(
     current: TorMetricsSnapshot | None,
     previous: TorMetricsSnapshot | None,
@@ -252,9 +262,7 @@ def correlate_triage(
         else:
             est_nonrelay = agg.total_sockets * stride
             nonrelay_sockets += est_nonrelay
-            # Under 1-in-N overload sampling, require >= 3 raw samples so 1-2 socket clients never reveal/ban.
-            min_stride_samples = max(3, (flood_threshold // stride) + 1)
-            threshold_count = est_nonrelay if (stride == 1 or agg.total_sockets >= min_stride_samples) else 0
+            threshold_count = _stride_eligible_count(agg.total_sockets, stride, flood_threshold)
             if threshold_count >= flood_threshold:
                 heavy_nonrelay_ips.append(remote_ip)
             peer_label = vault.classify_nonrelay(remote_ip, threshold_count)
@@ -302,10 +310,18 @@ def correlate_triage(
 
     if total_syn_recv >= flood_threshold:
         reasons.append(f"HIGH_SYN_RECV_BACKLOG ({total_syn_recv} half-open sockets)")
-    heavy_relays = [r for r in consensus_peers if (r.stats.total_sockets * stride) >= flood_threshold]
+    heavy_relays = [
+        r
+        for r in consensus_peers
+        if _stride_eligible_count(r.stats.total_sockets, stride, flood_threshold) >= flood_threshold
+    ]
     if heavy_relays:
         reasons.append(f"HEAVY_CONSENSUS_RELAY_PEERS ({len(heavy_relays)} relays >= {flood_threshold} sockets)")
-    heavy_nonrelays = [p for p in nonrelay_peers if (p.stats.total_sockets * stride) >= flood_threshold]
+    heavy_nonrelays = [
+        p
+        for p in nonrelay_peers
+        if _stride_eligible_count(p.stats.total_sockets, stride, flood_threshold) >= flood_threshold
+    ]
     if heavy_nonrelays:
         reasons.append(f"NONRELAY_PEER_FLOOD ({len(heavy_nonrelays)} peers >= {flood_threshold} sockets)")
     heavy_clusters = [c for c in cluster_rollups if c.total_sockets >= flood_threshold * 2]

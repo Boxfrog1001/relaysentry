@@ -28,7 +28,7 @@ Any tool inspecting a Tor relay's socket table risks recording honest Tor users'
 
 RelaySentry consumes only official Tor operator interfaces:
 
-* **Linux Kernel `procfs` (`/proc/net/tcp`, `/proc/net/tcp6`):** Direct pure-Python decoding (bounded to `64 MiB` on live reads) of active TCP states (`ESTABLISHED`, `SYN_SENT`, `SYN_RECV` — excluding `LISTEN`, `TIME_WAIT`, `CLOSE_WAIT`, and closing states) and per-socket `rx_queue` / `tx_queue` bytes on local `ORPort` / `DirPort` without invoking shell commands. Above `--max-exact-sockets` (default `50000`), deterministic `1-in-16` stride sampling engages with a minimum raw sample floor before reveal/ban eligibility.
+* **Linux Kernel `procfs` (`/proc/net/tcp`, `/proc/net/tcp6`):** Direct pure-Python decoding (bounded to `64 MiB` on live reads) of active TCP states (`ESTABLISHED`, `SYN_SENT`, `SYN_RECV`, and `NEW_SYN_RECV` (`0C`) — excluding `LISTEN`, `TIME_WAIT`, `CLOSE_WAIT`, and closing states) and per-socket `rx_queue` / `tx_queue` bytes on local `ORPort` / `DirPort` without invoking shell commands. Above `--max-exact-sockets` (default `50000`), deterministic `1-in-16` stride sampling engages with a minimum raw sample floor before reveal, ban, or `NONRELAY_PEER_FLOOD` eligibility.
 * **Tor `MetricsPort` (Prometheus Text Exposition, `src/feature/relay/relay_metrics.c`):**
   * `tor_relay_connections` (`type`, `direction`, `state`, `family`)
   * `tor_relay_load_onionskins_total` (`type`, `action` = `processed` / `dropped`)
