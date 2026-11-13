@@ -59,4 +59,19 @@ Every single one of those findings is patched in `v0.3.1`:
 * Line-by-line `bpftool` `ENOENT`-tolerant cleanup on LRU-evicted keys, global `BPF_MAP_TYPE_LRU_HASH` SYN buckets across cores, and a bounded IPv6 extension-header walker in XDP C.
 * Strict `TIME_WAIT`/closing exclusion in `/proc/net/tcp[6]`, `>= 3` raw sample floor under stride sampling, periodic Consensus refresh in `--watch`, empty-Consensus live-shield safety abort under `--offline`, and HMAC-masked `added_bans` output unless `--reveal-flooders` is explicitly set.
 
+---
+
+## Stage 5 — `v0.3.2` Offline Chutney (`Tor 0.4.9.11`) & Live Linux `6.6` Kernel Verification
+
+Static and hostile audits catch logic bugs, **live kernel toolchains and real Tor daemons catch environmental reality**. Running `RelaySentry` inside isolated network namespaces (`rs_relay` <-> `rs_atk`) against a 6-node offline Chutney `basic-min` network (`Tor 0.4.9.11` with `MetricsPort`, `ControlPort`, `cookie_auth`, `cached-consensus`, and `cached-microdesc-consensus`), real `clang 19` + `bpftool 7.5.0` (`xdpgeneric` on `veth_r`), and real `nftables 1.1.3` uncovered four real-world edge cases:
+
+1. **`cached-microdesc-consensus` Format (`src/consensus_index.py`):**
+   Tor `0.4.x` relays and clients primarily store `cached-microdesc-consensus`, where `r` lines omit the descriptor digest (`parts[5]` is the IP rather than `parts[6]`). Hardcoding `parts[6]` caused all microdesc relays to fail IP parsing (`consensus_relay_sockets: 0`). Fixed by detecting the date field index cleanly so both v3 full consensus and microdesc consensus index every relay.
+2. **XDP UAPI Header Compilation (`src/shield_engine.py`):**
+   `clang -target bpf` failed on kernel-internal `struct frag_hdr` (absent in `/usr/include/linux/ipv6.h`). Replaced with UAPI-safe `struct ipv6_frag_hdr_min` (skipping non-first fragments) and documented `-I/usr/include/$(uname -m)-linux-gnu`, passing `clang -Wall -Werror` and Linux `6.6.147` verifier cleanly.
+3. **Banned Flooder `FIN`/`RST` Teardown Deadlock (XDP & `nftables`):**
+   Dropping 100% of packets from an IP in `blocked_v4` / `tor_ddos4` blocked the flooder's TCP `FIN`/`RST` packets when closing connections, pinning `ESTABLISHED` zombie sockets in `/proc/net/tcp` and delaying hysteresis `NORMAL` recovery. Added token-bucket/rate-bounded non-`SYN` `FIN`/`RST` teardown rules (`syn_bucket_v4/6` in XDP, `tor_fin4/6` in `nftables`) so legitimate teardowns free Tor sockets immediately without opening a `FIN`/`RST` flood bypass.
+4. **Kernels Without `CONFIG_NFT_CONNLIMIT`, `sbin` Paths & Active-Ban Persistence:**
+   Minimal/container kernels lacking `nft_connlimit` aborted transactional `nft -f -` loads on `ct count over`; added `kernel_supports_nft_connlimit()` auto-detection, `--no-nft-connlimit`, `/usr/sbin` binary resolution when `$PATH` omits `sbin`, and remaining-TTL re-injection of unexpired bans across `nft` table re-syncs.
+
 **Practical takeaway:** `RelaySentry` isn't a replacement for upstream Tor C fixes—it's a hardened, battle-audited shield and forensic triage bridge designed to keep real relay operators online safely until the next upstream Tor mitigation lands cleanly across the network.

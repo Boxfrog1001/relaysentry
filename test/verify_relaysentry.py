@@ -983,6 +983,64 @@ def test_builtin_shield_controller_and_xdp_sync() -> None:
         assert all(b.startswith("anon#") for b in parsed_dry["shield_enforcement"]["added_bans"])
         assert "203.0.113.222" not in buf.getvalue()
 
+        # (e) Regression checks from real Chutney Tor 0.4.9.11 & Linux 6.6 kernel testing (v0.3.2):
+        # 1. cached-microdesc-consensus (8-token `r` line without descriptor digest + `a [...]`)
+        md_text = "\n".join(
+            [
+                "network-status-version 3 microdesc",
+                "vote-status consensus",
+                "r TestMicro01 AAAAAAAAAAAAAAAAAAAAAAAAAAA 2038-01-01 00:00:00 198.51.100.77 5001 7001",
+                "a [2001:db8::77]:5001",
+                "m Dm0QswKsTRFx6/LaIdID8nxg0xGlMxJRvdMV9g/f/PI",
+                "s Fast Guard Running Stable Valid",
+                "v Tor 0.4.9.11",
+            ]
+        )
+        md_idx = ConsensusIndex.from_cached_consensus(md_text)
+        assert md_idx.lookup_ip("198.51.100.77") and md_idx.lookup_ip("2001:db8::77")
+
+        # 2. XDP C shield uses UAPI-safe ipv6_frag_hdr_min and bounded FIN/RST teardown
+        xdp_c = render_xdp_shield_c({5004, 7004})
+        assert "struct ipv6_frag_hdr_min" in xdp_c and "struct frag_hdr " not in xdp_c
+        assert "tcph->fin || tcph->rst" in xdp_c
+        assert "-I/usr/include/$(uname -m)-linux-gnu" in xdp_c
+
+        # 3. nftables include_connlimit=False + tor_fin4/6 teardown + --no-nft-connlimit CLI
+        nft_no_conn = generate_nft_consensus_sync(
+            ["198.51.100.77"], {5004}, include_connlimit=False
+        )
+        assert "set connlimit4" not in nft_no_conn and "ct count over" not in nft_no_conn
+        assert "set tor_fin4" in nft_no_conn and "tcp flags & (fin | rst) != 0" in nft_no_conn
+        assert cli_main(
+            [
+                "--port",
+                "9001",
+                "--consensus-file",
+                str(cons_file),
+                "--offline",
+                "--no-cache",
+                "--emit-nft-consensus",
+                "--no-nft-connlimit",
+            ]
+        ) == 0
+
+        # 4. Surviving nft active_bans re-injected after table recreate during consensus refresh
+        resync_calls: list[tuple[list[str], str]] = []
+        resync_ctrl = ShieldController(
+            ports={5004},
+            consensus_ips=["198.51.100.77"],
+            backend="nft",
+            dry_run=False,
+            ban_ttl_seconds=100,
+            command_runner=lambda argv, payload: resync_calls.append((argv, payload)),
+            include_connlimit=False,
+        )
+        resync_ctrl.reconcile("ACTIVE_DOS_PRESSURE", ["203.0.113.88"], now_monotonic=10.0)
+        resync_ctrl.update_consensus(["198.51.100.77", "198.51.100.78"])
+        resync_ctrl.reconcile("ACTIVE_DOS_PRESSURE", ["203.0.113.88"], now_monotonic=25.0)
+        assert "delete table inet relaysentry_shield" in resync_calls[-1][1]
+        assert "add element inet relaysentry_shield tor_ddos4 { 203.0.113.88 timeout 85s }" in resync_calls[-1][1]
+
     print("  [PASS] Built-in ShieldController (nft/XDP), --emit-xdp-sync & dry-run CLI verified.")
 
 

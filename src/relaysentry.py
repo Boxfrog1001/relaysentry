@@ -26,6 +26,7 @@ from shield_engine import (
     TelemetryRingBuffer,
     generate_nft_consensus_sync,
     generate_xdp_map_sync,
+    kernel_supports_nft_connlimit,
     render_xdp_shield_c,
 )
 from telemetry_procfs import (
@@ -293,6 +294,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit atomic nftables consensus allowlist (known_relays4/6) + non-relay DoS rate-limit script tailored to --port",
     )
     p.add_argument(
+        "--no-nft-connlimit",
+        action="store_true",
+        help="Omit dynamic connlimit4/connlimit6 (`ct count over`) rules in generated nftables output (for kernels lacking CONFIG_NFT_CONNLIMIT)",
+    )
+    p.add_argument(
         "--emit-xdp-sync",
         action="store_true",
         help="Emit bpftool batch script populating allow_relay_v4/6 (and blocked_v4/6 if enabled) from Consensus",
@@ -536,6 +542,7 @@ def main(argv: list[str] | None = None) -> int:
                 conn_limit=args.flood_threshold,
                 ban_timeout=f"{args.ban_ttl}s",
                 allow_cidrs=args.allow_cidr,
+                include_connlimit=False if args.no_nft_connlimit else kernel_supports_nft_connlimit(),
             )
         )
         return 0
@@ -575,6 +582,7 @@ def main(argv: list[str] | None = None) -> int:
                 flood_threshold=args.flood_threshold,
                 bpf_pin_dir=args.bpf_pin_dir,
                 allow_cidrs=args.allow_cidr,
+                include_connlimit=False if args.no_nft_connlimit else None,
             )
         except (ValueError, RuntimeError) as exc:
             print(f"[ERROR] Shield initialization failed: {exc}", file=sys.stderr)

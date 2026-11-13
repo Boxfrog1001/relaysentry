@@ -78,7 +78,7 @@ Smoke-check the generated `nftables` ruleset against your live kernel (`CAP_NET_
 ./bin/relaysentry --port 9001 --port 9030 --allow-cidr 198.51.100.0/24 --emit-nft-consensus | sudo nft -f -
 ```
 
-Enforce live via `nftables` (`allow_net4/6` + `known_relays4/6` + per-IP dynamic `tor_syn4/6` + auto-expiring `tor_ddos4/6`; Tor relays, loopback, and `--allow-cidr` stay exempt):
+Enforce live via `nftables` (`allow_net4/6` + `known_relays4/6` + per-IP dynamic `tor_syn4/6` + bounded teardown `tor_fin4/6` + auto-expiring `tor_ddos4/6`; Tor relays, loopback, and `--allow-cidr` stay exempt):
 ```bash
 sudo ./bin/relaysentry --port 9001 --port 9030 --allow-cidr 198.51.100.0/24 --enforce-shield --shield-backend nft --ban-ttl 1800 --watch 5
 ```

@@ -9,10 +9,13 @@ Provides:
 - Compilable dual-stack eBPF/XDP C shield template with consensus allowlist + SYN token bucket
 """
 
+import gzip
 import ipaddress
 import math
+import os
 import shutil
 import subprocess
+import sys
 import time
 from collections import deque
 from collections.abc import Callable, Iterable
@@ -212,6 +215,60 @@ def generate_tor_defense_hints(
     return hints
 
 
+def _resolve_shield_binary(name: str) -> str | None:
+    """Resolve `nft` or `bpftool` across PATH and standard sbin directories."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for prefix in ("/usr/sbin", "/sbin", "/usr/bin", "/bin"):
+        candidate = f"{prefix}/{name}"
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def kernel_supports_nft_connlimit(nft_bin: str | None = None) -> bool:
+    """Detect whether the running kernel supports nftables dynamic ct count (`CONFIG_NFT_CONNLIMIT`)."""
+    proc_cfg = Path("/proc/config.gz")
+    if proc_cfg.exists():
+        try:
+            with gzip.open(proc_cfg, "rt", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.strip() == "# CONFIG_NFT_CONNLIMIT is not set":
+                        return False
+        except OSError:
+            pass
+    boot_cfg = Path(f"/boot/config-{os.uname().release}")
+    if boot_cfg.exists():
+        try:
+            with boot_cfg.open("rt", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.strip() == "# CONFIG_NFT_CONNLIMIT is not set":
+                        return False
+        except OSError:
+            pass
+    exe = nft_bin or _resolve_shield_binary("nft")
+    if exe and os.geteuid() == 0:
+        probe = (
+            "table inet _rs_connlimit_probe {\n"
+            "    set s {\n"
+            "        type ipv4_addr\n"
+            "        size 64\n"
+            "        flags dynamic\n"
+            "    }\n"
+            "    chain c {\n"
+            "        ct count over 10 add @s { ip saddr }\n"
+            "    }\n"
+            "}\n"
+        )
+        try:
+            proc = subprocess.run([exe, "-c", "-f", "-"], input=probe, text=True, capture_output=True, check=False, timeout=5)
+            return proc.returncode == 0
+        except OSError:
+            return False
+    return True
+
+
 def generate_nft_consensus_sync(
     consensus_ips: Iterable[str],
     ports: set[int],
@@ -220,6 +277,7 @@ def generate_nft_consensus_sync(
     burst: int = 20,
     ban_timeout: str = "30m",
     allow_cidrs: Iterable[str] = (),
+    include_connlimit: bool = True,
 ) -> str:
     """Emit atomic, idempotent nftables consensus & --allow-cidr allowlist + per-IP DoS shield."""
     sorted_ports = [p for p in sorted(ports) if 1 <= p <= 65535]
@@ -302,38 +360,79 @@ def generate_nft_consensus_sync(
         "        flags dynamic, timeout",
         "        timeout 60s",
         "    }",
-        "    set connlimit4 {",
+        "    set tor_fin4 {",
         "        type ipv4_addr",
         "        size 65536",
         "        flags dynamic, timeout",
-        "        timeout 120s",
+        "        timeout 30s",
         "    }",
-        "    set connlimit6 {",
+        "    set tor_fin6 {",
         "        type ipv6_addr",
         "        size 65536",
         "        flags dynamic, timeout",
-        "        timeout 120s",
+        "        timeout 30s",
         "    }",
-        "    chain input {",
-        "        type filter hook input priority filter; policy accept;",
-        "    }",
-        "}",
-        "flush chain inet relaysentry_shield input",
-        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip saddr @allow_net4 accept",
-        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip6 saddr @allow_net6 accept",
-        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip saddr @known_relays4 accept",
-        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip6 saddr @known_relays6 accept",
-        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip saddr @tor_ddos4 drop",
-        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip6 saddr @tor_ddos6 drop",
-        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip saddr != @known_relays4 add @tor_syn4 {{ ip saddr limit rate over {rate_limit} burst {burst} packets }} add @tor_ddos4 {{ ip saddr }} drop",
-        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip6 saddr != @known_relays6 add @tor_syn6 {{ ip6 saddr limit rate over {rate_limit} burst {burst} packets }} add @tor_ddos6 {{ ip6 saddr }} drop",
-        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip saddr != @known_relays4 add @connlimit4 {{ ip saddr ct count over {conn_limit} }} drop",
-        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip6 saddr != @known_relays6 add @connlimit6 {{ ip6 saddr ct count over {conn_limit} }} drop",
-        "flush set inet relaysentry_shield allow_net4",
-        "flush set inet relaysentry_shield allow_net6",
-        "flush set inet relaysentry_shield known_relays4",
-        "flush set inet relaysentry_shield known_relays6",
     ]
+    if include_connlimit:
+        lines.extend(
+            [
+                "    set connlimit4 {",
+                "        type ipv4_addr",
+                "        size 65536",
+                "        flags dynamic, timeout",
+                "        timeout 120s",
+                "    }",
+                "    set connlimit6 {",
+                "        type ipv6_addr",
+                "        size 65536",
+                "        flags dynamic, timeout",
+                "        timeout 120s",
+                "    }",
+            ]
+        )
+    else:
+        lines.append(
+            "    # Kernel lacks CONFIG_NFT_CONNLIMIT; connlimit4/6 omitted "
+            "(userspace --enforce-shield handles --flood-threshold)"
+        )
+    lines.extend(
+        [
+            "    chain input {",
+            "        type filter hook input priority filter; policy accept;",
+            "    }",
+            "}",
+            "flush chain inet relaysentry_shield input",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip saddr @allow_net4 accept",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip6 saddr @allow_net6 accept",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip saddr @known_relays4 accept",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip6 saddr @known_relays6 accept",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip saddr @tor_ddos4 tcp flags & syn != 0 drop",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip6 saddr @tor_ddos6 tcp flags & syn != 0 drop",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip saddr @tor_ddos4 tcp flags & (fin | rst) != 0 add @tor_fin4 {{ ip saddr limit rate over 25/second burst 50 packets }} drop",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip6 saddr @tor_ddos6 tcp flags & (fin | rst) != 0 add @tor_fin6 {{ ip6 saddr limit rate over 25/second burst 50 packets }} drop",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip saddr @tor_ddos4 tcp flags & (fin | rst) != 0 accept",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip6 saddr @tor_ddos6 tcp flags & (fin | rst) != 0 accept",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip saddr @tor_ddos4 drop",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip6 saddr @tor_ddos6 drop",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip saddr != @known_relays4 add @tor_syn4 {{ ip saddr limit rate over {rate_limit} burst {burst} packets }} add @tor_ddos4 {{ ip saddr }} drop",
+            f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip6 saddr != @known_relays6 add @tor_syn6 {{ ip6 saddr limit rate over {rate_limit} burst {burst} packets }} add @tor_ddos6 {{ ip6 saddr }} drop",
+        ]
+    )
+    if include_connlimit:
+        lines.extend(
+            [
+                f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip saddr != @known_relays4 add @connlimit4 {{ ip saddr ct count over {conn_limit} }} drop",
+                f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip6 saddr != @known_relays6 add @connlimit6 {{ ip6 saddr ct count over {conn_limit} }} drop",
+            ]
+        )
+    lines.extend(
+        [
+            "flush set inet relaysentry_shield allow_net4",
+            "flush set inet relaysentry_shield allow_net6",
+            "flush set inet relaysentry_shield known_relays4",
+            "flush set inet relaysentry_shield known_relays6",
+        ]
+    )
     chunk_size = 256
     for idx in range(0, len(allow_v4_sorted), chunk_size):
         chunk = ", ".join(allow_v4_sorted[idx : idx + chunk_size])
@@ -437,7 +536,7 @@ def render_xdp_shield_c(
     refill_ns = max(1_000_000, 1_000_000_000 // max(1, syn_rate_per_sec))
 
     return f"""// RelaySentry v0.3 Dual-Stack XDP/eBPF Shield (O(1) NIC-ring SYN token bucket)
-// Compile : clang -O2 -g -target bpf -c relaysentry_xdp.c -o relaysentry_xdp.o
+// Compile : clang -O2 -g -target bpf -I/usr/include/$(uname -m)-linux-gnu -c relaysentry_xdp.c -o relaysentry_xdp.o
 // Pin+Load: sudo bpftool prog load relaysentry_xdp.o /sys/fs/bpf/relaysentry_xdp_prog pinmaps /sys/fs/bpf/relaysentry
 // Attach  : sudo bpftool net attach xdp pinned /sys/fs/bpf/relaysentry_xdp_prog dev <IFACE>
 // SyncMap : ./bin/relaysentry --port {sorted_ports[0]} --emit-xdp-sync | sudo bpftool batch file -
@@ -454,6 +553,13 @@ def render_xdp_shield_c(
 
 #define SYN_BURST        {syn_burst}U
 #define TOKEN_REFILL_NS  {refill_ns}ULL
+
+struct ipv6_frag_hdr_min {{
+    __u8 nexthdr;
+    __u8 reserved;
+    __be16 frag_off;
+    __be32 identification;
+}};
 
 struct vlan_hdr_min {{
     __be16 h_vlan_TCI;
@@ -566,6 +672,17 @@ int relaysentry_xdp_shield(struct xdp_md *ctx) {{
 
         __u64 *drops = bpf_map_lookup_elem(&blocked_v4, &src);
         if (drops) {{
+            if ((tcph->fin || tcph->rst) && !tcph->syn) {{
+                __u64 now = bpf_ktime_get_ns();
+                struct bucket_state *st = bpf_map_lookup_elem(&syn_bucket_v4, &src);
+                if (!st) {{
+                    struct bucket_state init = {{ .last_ns = now, .tokens = SYN_BURST - 1 }};
+                    bpf_map_update_elem(&syn_bucket_v4, &src, &init, BPF_ANY);
+                    return XDP_PASS;
+                }}
+                if (consume_token(st, now))
+                    return XDP_PASS;
+            }}
             __sync_fetch_and_add(drops, 1);
             return XDP_DROP;
         }}
@@ -601,8 +718,10 @@ int relaysentry_xdp_shield(struct xdp_md *ctx) {{
                 nexthdr = opt->nexthdr;
                 l4 = (void *)((unsigned char *)opt + ((opt->hdrlen + 1) * 8));
             }} else if (nexthdr == 44) {{
-                struct frag_hdr *frag = l4;
+                struct ipv6_frag_hdr_min *frag = l4;
                 if ((void *)(frag + 1) > data_end)
+                    return XDP_PASS;
+                if ((bpf_ntohs(frag->frag_off) & 0xFFF8U) != 0U)
                     return XDP_PASS;
                 nexthdr = frag->nexthdr;
                 l4 = (void *)(frag + 1);
@@ -627,6 +746,17 @@ int relaysentry_xdp_shield(struct xdp_md *ctx) {{
 
         __u64 *drops = bpf_map_lookup_elem(&blocked_v6, &key);
         if (drops) {{
+            if ((tcph->fin || tcph->rst) && !tcph->syn) {{
+                __u64 now = bpf_ktime_get_ns();
+                struct bucket_state *st = bpf_map_lookup_elem(&syn_bucket_v6, &key);
+                if (!st) {{
+                    struct bucket_state init = {{ .last_ns = now, .tokens = SYN_BURST - 1 }};
+                    bpf_map_update_elem(&syn_bucket_v6, &key, &init, BPF_ANY);
+                    return XDP_PASS;
+                }}
+                if (consume_token(st, now))
+                    return XDP_PASS;
+            }}
             __sync_fetch_and_add(drops, 1);
             return XDP_DROP;
         }}
@@ -680,8 +810,10 @@ class ShieldEnforcementSummary:
 
 def _default_command_runner(argv: list[str], stdin_payload: str) -> None:
     """Execute privileged nftables or bpftool batch safely without a shell."""
+    exe = _resolve_shield_binary(argv[0]) or argv[0] if argv else ""
+    resolved_argv = [exe, *argv[1:]] if argv else argv
     proc = subprocess.run(
-        argv,
+        resolved_argv,
         input=stdin_payload,
         text=True,
         capture_output=True,
@@ -692,14 +824,14 @@ def _default_command_runner(argv: list[str], stdin_payload: str) -> None:
         return
     # bpftool batch aborts on map delete ENOENT if LRU_HASH already evicted the key;
     # fall back to per-line execution ignoring ENOENT on map delete so bans never deadlock.
-    if argv and argv[0] == "bpftool" and "No such file or directory" in (proc.stderr or ""):
+    if resolved_argv and Path(resolved_argv[0]).name == "bpftool" and "No such file or directory" in (proc.stderr or ""):
         for line in stdin_payload.splitlines():
             line = line.strip()
             if not line:
                 continue
             parts = line.split()
             sub = subprocess.run(
-                ["bpftool", *parts],
+                [resolved_argv[0], *parts],
                 text=True,
                 capture_output=True,
                 check=False,
@@ -708,9 +840,11 @@ def _default_command_runner(argv: list[str], stdin_payload: str) -> None:
             if sub.returncode != 0:
                 if parts[:2] == ["map", "delete"] and "No such file or directory" in (sub.stderr or ""):
                     continue
-                raise subprocess.CalledProcessError(sub.returncode, ["bpftool", *parts], sub.stdout, sub.stderr)
+                raise subprocess.CalledProcessError(
+                    sub.returncode, [resolved_argv[0], *parts], sub.stdout, sub.stderr
+                )
         return
-    raise subprocess.CalledProcessError(proc.returncode, argv, proc.stdout, proc.stderr)
+    raise subprocess.CalledProcessError(proc.returncode, resolved_argv, proc.stdout, proc.stderr)
 
 
 class ShieldController:
@@ -729,6 +863,7 @@ class ShieldController:
         allow_cidrs: Iterable[str] = (),
         command_runner: Callable[[list[str], str], None] | None = None,
         backend_detector: Callable[[], str] | None = None,
+        include_connlimit: bool | None = None,
     ) -> None:
         if backend not in ("auto", "nft", "xdp"):
             raise ValueError(f"Unsupported shield backend: {backend}")
@@ -747,6 +882,18 @@ class ShieldController:
         self._runner = command_runner or _default_command_runner
         self._backend_detector = backend_detector
         self.backend = self._resolve_backend(backend)
+        if include_connlimit is not None:
+            self.include_connlimit = bool(include_connlimit)
+        elif self.backend == "nft" and not self.dry_run and command_runner is None:
+            self.include_connlimit = kernel_supports_nft_connlimit(_resolve_shield_binary("nft"))
+            if not self.include_connlimit:
+                print(
+                    "[SHIELD] Kernel lacks CONFIG_NFT_CONNLIMIT; using per-IP tor_syn rate limits "
+                    "+ userspace --flood-threshold blocking.",
+                    file=sys.stderr,
+                )
+        else:
+            self.include_connlimit = True
 
         self.consensus_ips: set[str] = set()
         for raw_ip in consensus_ips:
@@ -779,18 +926,18 @@ class ShieldController:
 
     def _resolve_backend(self, requested: str) -> str:
         if requested != "auto":
-            if not self.dry_run and shutil.which("nft" if requested == "nft" else "bpftool") is None:
+            if not self.dry_run and _resolve_shield_binary("nft" if requested == "nft" else "bpftool") is None:
                 raise RuntimeError(f"Required shield binary '{requested}' is not installed in PATH")
             return requested
         if self._backend_detector is not None:
             return self._backend_detector()
-        if shutil.which("bpftool"):
+        if _resolve_shield_binary("bpftool"):
             try:
                 if Path(f"{self.bpf_pin_dir}/blocked_v4").exists():
                     return "xdp"
             except OSError:
                 pass
-        if shutil.which("nft"):
+        if _resolve_shield_binary("nft"):
             return "nft"
         if self.dry_run:
             return "nft"
@@ -837,6 +984,7 @@ class ShieldController:
                     conn_limit=self.flood_threshold,
                     ban_timeout=f"{self.ban_ttl_seconds}s",
                     allow_cidrs=[str(n) for n in self.allow_networks],
+                    include_connlimit=self.include_connlimit,
                 )
             else:
                 xdp_allow = set(self.consensus_ips)
@@ -898,18 +1046,29 @@ class ShieldController:
                 else:
                     v6_new.append(canonical)
 
-            if added_bans:
-                if self.backend == "nft":
-                    if v4_new:
-                        elems4 = ", ".join(f"{ip} timeout {self.ban_ttl_seconds}s" for ip in v4_new)
-                        payload_chunks.append(f"add element inet relaysentry_shield tor_ddos4 {{ {elems4} }}")
-                    if v6_new:
-                        elems6 = ", ".join(f"{ip} timeout {self.ban_ttl_seconds}s" for ip in v6_new)
-                        payload_chunks.append(f"add element inet relaysentry_shield tor_ddos6 {{ {elems6} }}")
-                else:
-                    payload_chunks.append(
-                        generate_xdp_map_sync((), blocked_ips=added_bans, pin_dir=self.bpf_pin_dir)
-                    )
+            if self.backend == "nft":
+                v4_emit = [f"{ip} timeout {self.ban_ttl_seconds}s" for ip in v4_new]
+                v6_emit = [f"{ip} timeout {self.ban_ttl_seconds}s" for ip in v6_new]
+                if consensus_synced:
+                    new_set = set(added_bans)
+                    for ip, deadline in sorted(staged_bans.items()):
+                        if ip in new_set:
+                            continue
+                        rem = max(1, int(deadline - now))
+                        if ":" in ip:
+                            v6_emit.append(f"{ip} timeout {rem}s")
+                        else:
+                            v4_emit.append(f"{ip} timeout {rem}s")
+                if v4_emit:
+                    elems4 = ", ".join(v4_emit)
+                    payload_chunks.append(f"add element inet relaysentry_shield tor_ddos4 {{ {elems4} }}")
+                if v6_emit:
+                    elems6 = ", ".join(v6_emit)
+                    payload_chunks.append(f"add element inet relaysentry_shield tor_ddos6 {{ {elems6} }}")
+            elif added_bans:
+                payload_chunks.append(
+                    generate_xdp_map_sync((), blocked_ips=added_bans, pin_dir=self.bpf_pin_dir)
+                )
 
         combined_payload = "\n".join(c for c in payload_chunks if c.strip())
         self._apply(combined_payload)

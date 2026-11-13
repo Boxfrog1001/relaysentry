@@ -31,6 +31,7 @@ DEFAULT_CACHE_PATH = Path.home() / ".cache" / "relaysentry" / "onionoo_details.j
 DEFAULT_CACHE_TTL_SECONDS = 3600
 MAX_CONSENSUS_BYTES = 128 * 1024 * 1024  # 128 MiB bounded read
 FINGERPRINT_RE = re.compile(r"^\$?([0-9A-Fa-f]{40})(?:[=~].*)?$")
+_DATE_TOKEN_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def clean_fingerprint(raw: str) -> str:
@@ -163,7 +164,17 @@ class ConsensusIndex:
                 if len(parts) < 8:
                     current = None
                     continue
-                nick, b64_id, ip_raw = parts[1], parts[2], parts[6]
+                # v3 full consensus includes descriptor digest (`parts[3]`, date at `parts[4]`, IP at `parts[6]`);
+                # microdesc consensus omits digest (date at `parts[3]`, IP at `parts[5]`).
+                if _DATE_TOKEN_RE.match(parts[3]):
+                    ip_raw = parts[5]
+                elif len(parts) >= 9 and _DATE_TOKEN_RE.match(parts[4]):
+                    ip_raw = parts[6]
+                elif len(parts) == 8:
+                    ip_raw = parts[5]
+                else:
+                    ip_raw = parts[6]
+                nick, b64_id = parts[1], parts[2]
                 pad = "=" * ((4 - len(b64_id) % 4) % 4)
                 try:
                     fp = base64.b64decode(b64_id + pad).hex().upper()
