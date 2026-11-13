@@ -1,0 +1,1 @@
+# RelaySentry uses Python 3 standard library modules only (zero external runtime dependencies).
