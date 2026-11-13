@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="relaysentry",
-    version="0.3.0",
+    version="0.3.1",
     description="Privacy-preserving Tor relay DoS triage, consensus peer attribution & adaptive shield CLI",
     author="RelaySentry Contributors",
     license="BSD-2-Clause",

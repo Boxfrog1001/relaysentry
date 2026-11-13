@@ -123,10 +123,19 @@ def parse_proc_net_tcp_lines_bounded(
         parts = line.split()
         if len(parts) < 8 or parts[0] == "sl":
             continue
-        local = decode_proc_addr(parts[1])
-        if local is None or local[1] not in monitored_ports:
+        st_code = parts[3].upper()
+        # Exclude LISTEN (0A) unless requested, and always exclude TIME_WAIT / closing states.
+        if st_code == "0A":
+            if not include_listen:
+                continue
+        elif st_code not in ("01", "02", "03"):
             continue
-        if not include_listen and parts[3].upper() == "0A":
+        try:
+            _, port_hex = parts[1].rsplit(":", 1)
+            local_port = int(port_hex, 16)
+        except ValueError:
+            continue
+        if local_port not in monitored_ports:
             continue
 
         if cap and stride == 1 and match_idx >= cap:
@@ -134,9 +143,28 @@ def parse_proc_net_tcp_lines_bounded(
             entries = entries[::stride]
 
         if match_idx % stride == 0:
-            entry = _decode_socket_line(line, monitored_ports, include_listen)
-            if entry is not None:
-                entries.append(entry)
+            local = decode_proc_addr(parts[1])
+            remote = decode_proc_addr(parts[2])
+            if local is not None and remote is not None:
+                q_match = HEX_PAIR_RE.match(parts[4])
+                tx_q = int(q_match.group(1), 16) if q_match else 0
+                rx_q = int(q_match.group(2), 16) if q_match else 0
+                try:
+                    uid = int(parts[7])
+                except ValueError:
+                    uid = -1
+                entries.append(
+                    SocketEntry(
+                        local_ip=local[0],
+                        local_port=local[1],
+                        remote_ip=remote[0],
+                        remote_port=remote[1],
+                        state=TCP_STATES.get(st_code, f"STATE_{st_code}"),
+                        tx_queue=tx_q,
+                        rx_queue=rx_q,
+                        uid=uid,
+                    )
+                )
         match_idx += 1
 
     return entries, stride
@@ -163,13 +191,20 @@ def read_live_procfs_sockets_bounded(
     tcp6_path: Path = Path("/proc/net/tcp6"),
     max_exact_sockets: int = DEFAULT_MAX_EXACT_SOCKETS,
 ) -> tuple[list[SocketEntry], int]:
-    """Read and decode active TCPv4/TCPv6 sockets with overload stride protection."""
+    """Read and decode active TCPv4/TCPv6 sockets with overload stride & 64 MiB byte cap."""
+    max_procfs_bytes = 64 * 1024 * 1024
+
     def _iter_files():
+        total = 0
         for path in (tcp4_path, tcp6_path):
             if not path.exists():
                 continue
             with path.open("r", encoding="utf-8", errors="replace") as fh:
-                yield from fh
+                for line in fh:
+                    total += len(line.encode("utf-8", errors="replace"))
+                    if total > max_procfs_bytes:
+                        return
+                    yield line
 
     return parse_proc_net_tcp_lines_bounded(
         _iter_files(),

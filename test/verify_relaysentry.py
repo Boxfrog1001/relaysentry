@@ -204,9 +204,9 @@ def test_consensus_attribution_and_cluster_rollup() -> None:
     assert report.nonrelay_peers[0].label == "192.0.2.200"  # revealed flooder >= 25
     assert report.nonrelay_peers[1].masked is True  # honest 2-socket client stayed masked!
     assert "192.0.2.50" not in report.nonrelay_peers[1].label
-    assert len(report.nft_hints) == 2
-    assert "raw prerouting" in report.nft_hints[0] and "notrack" in report.nft_hints[0]
-    assert "192.0.2.200" in report.nft_hints[0] and "limit rate" in report.nft_hints[1]
+    assert len(report.nft_hints) == 1
+    assert "relaysentry_hints" in report.nft_hints[0]
+    assert "192.0.2.200" in report.nft_hints[0] and "limit rate" in report.nft_hints[0]
     assert report.flood_shape == "CONCENTRATED_SOURCE"
     assert report.tor_defense_hints, "Expected actionable Tor PoW/kernel defense guidance"
     print("  [PASS] Family cluster rollup, threshold gating, MetricsPort delta & nft hint verified.")
@@ -642,7 +642,7 @@ def test_adaptive_shield_xdp_entropy_and_stride() -> None:
     assert 'SEC("xdp")' in xdp_src
     assert "allow_relay_v4" in xdp_src and "allow_relay_v6" in xdp_src
     assert "blocked_v4" in xdp_src and "blocked_v6" in xdp_src
-    assert "BPF_MAP_TYPE_LRU_PERCPU_HASH" in xdp_src
+    assert "BPF_MAP_TYPE_LRU_HASH" in xdp_src
     assert "dport == 9001 || dport == 9030" in xdp_src
     assert cli_main(["--port", "9001", "--emit-xdp-c"]) == 0
     print("  [PASS] Hysteresis, Shannon flood classifier, 1-in-16 stride privacy & XDP C verified.")
@@ -767,9 +767,19 @@ def test_thunderstorm_and_unresponsive_metrics_resilience() -> None:
         assert any("METRICS_PORT_UNRESPONSIVE" in r for r in stalled_rep.reasons)
         assert any("CONTROL_PORT_UNRESPONSIVE" in r for r in stalled_rep.reasons)
 
-        # 4. Dual-stack consensus nftables sync + CLI flag (dynamic sets + connlimit + chunking)
-        nft_script = generate_nft_consensus_sync(cons_idx.ip_to_fps.keys(), {9001, 9030})
+        # 4. Dual-stack consensus nftables sync + CLI flag (per-IP dynamic sets + allow_net + connlimit + chunking)
+        nft_script = generate_nft_consensus_sync(
+            cons_idx.ip_to_fps.keys(),
+            {9001, 9030},
+            allow_cidrs=["198.51.100.0/24"],
+        )
+        assert "add table inet relaysentry_shield" in nft_script
+        assert "delete table inet relaysentry_shield" in nft_script
+        assert "set allow_net4" in nft_script and "flags interval" in nft_script
+        assert "198.51.100.0/24" in nft_script and "127.0.0.0/8" in nft_script
         assert "set known_relays4" in nft_script and "set known_relays6" in nft_script
+        assert "set tor_syn4" in nft_script and "set tor_syn6" in nft_script
+        assert "add @tor_syn4 { ip saddr limit rate" in nft_script
         assert "set tor_ddos4" in nft_script and "set tor_ddos6" in nft_script
         assert "set connlimit4" in nft_script and "set connlimit6" in nft_script
         assert "flags dynamic, timeout" in nft_script and "size 65536" in nft_script
@@ -834,6 +844,8 @@ def test_builtin_shield_controller_and_xdp_sync() -> None:
     assert s1.added_bans == ("203.0.113.200", "2001:db8:bad::1")
     assert s1.active_ban_count == 2
     assert nft_calls[-1][0] == ["nft", "-f", "-"]
+    assert "allow_net4" in nft_calls[-1][1] and "198.51.100.0/24" in nft_calls[-1][1]
+    assert "add @tor_syn4" in nft_calls[-1][1]
     assert "tor_ddos4 { 203.0.113.200 timeout 1800s }" in nft_calls[-1][1]
     assert "tor_ddos6 { 2001:db8:bad::1 timeout 1800s }" in nft_calls[-1][1]
 
@@ -844,6 +856,13 @@ def test_builtin_shield_controller_and_xdp_sync() -> None:
     # Step back to NORMAL after hysteresis -> flush active tor_ddos4/6 cleanly
     s3 = nft_ctrl.reconcile("NORMAL", [], now_monotonic=200.0)
     assert s3.cleared_bans == 2 and s3.active_ban_count == 0
+    assert "flush set inet relaysentry_shield tor_ddos4" in nft_calls[-1][1]
+    assert "flush set inet relaysentry_shield tor_ddos6" in nft_calls[-1][1]
+
+    # Even if Python active_bans was empty during an attack tick (kernel-added bans), NORMAL recovery flushes sets
+    s4 = nft_ctrl.reconcile("ELEVATED_PRESSURE", [], now_monotonic=210.0)
+    assert s4.active_ban_count == 0
+    s5 = nft_ctrl.reconcile("NORMAL", [], now_monotonic=220.0)
     assert "flush set inet relaysentry_shield tor_ddos4" in nft_calls[-1][1]
     assert "flush set inet relaysentry_shield tor_ddos6" in nft_calls[-1][1]
 
@@ -920,23 +939,49 @@ def test_builtin_shield_controller_and_xdp_sync() -> None:
         assert cli_main(
             ["--port", "9001", "--consensus-file", str(cons_file), "--offline", "--no-cache", "--emit-xdp-sync"]
         ) == 0
-        assert cli_main(
-            [
-                "--port",
-                "9001",
-                "--consensus-file",
-                str(cons_file),
-                "--proc-tcp-file",
-                str(tcp_file),
-                "--offline",
-                "--no-cache",
-                "--enforce-shield",
-                "--shield-dry-run",
-                "--allow-cidr",
-                "198.51.100.0/24",
-                "--json",
-            ]
-        ) == 0
+        # Regression checks from Goldfish hostile audits (v0.3.1):
+        # (a) --offline --enforce-shield with empty cache/consensus refuses live enforcement (rc=2)
+        empty_cache_rc = cli_main(
+            ["--port", "9001", "--offline", "--no-cache", "--enforce-shield"]
+        )
+        assert empty_cache_rc == 2
+        # (b) TIME_WAIT (06) sockets excluded from procfs counts, and 2-socket peer stays masked under stride=16
+        tw_lines = [
+            f" {i:3d}: {_encode_ipv4_hex_le('192.0.2.5')}:2329 "
+            f"{_encode_ipv4_hex_le('198.51.100.77')}:{42000 + i:04X} 06 00000000:00000000 00:00000000 0 105 0 {500 + i}"
+            for i in range(40)
+        ]
+        tw_sockets, _ = parse_proc_net_tcp_lines_bounded(tw_lines, {9001})
+        assert tw_sockets == [], "TIME_WAIT sockets must not trigger flood attribution"
+        # (c) Prometheus float overflow ('1e400') handled without crashing
+        inf_snap = parse_prometheus_metrics('tor_relay_connections_total{type="or",state="opened"} 1e400\n')
+        assert inf_snap.connections_opened == 0
+        # (d) --enforce-shield --shield-dry-run without --reveal-flooders keeps added_bans masked in stdout/JSON
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc_dry = cli_main(
+                [
+                    "--port",
+                    "9001",
+                    "--consensus-file",
+                    str(cons_file),
+                    "--proc-tcp-file",
+                    str(tcp_file),
+                    "--offline",
+                    "--no-cache",
+                    "--enforce-shield",
+                    "--shield-dry-run",
+                    "--allow-cidr",
+                    "198.51.100.0/24",
+                    "--json",
+                ]
+            )
+        assert rc_dry == 0
+        parsed_dry = json.loads(buf.getvalue())
+        assert parsed_dry["top_nonrelay_peers"][0]["masked"] is True
+        assert all(b.startswith("anon#") for b in parsed_dry["shield_enforcement"]["added_bans"])
+        assert "203.0.113.222" not in buf.getvalue()
 
     print("  [PASS] Built-in ShieldController (nft/XDP), --emit-xdp-sync & dry-run CLI verified.")
 

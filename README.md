@@ -21,11 +21,11 @@ When a Tor relay hits overload (`dropped ntor onionskins`, OOM invocations, or s
 
 ## Features
 
-* **Zero-Subprocess Kernel Socket Telemetry & Overload Stride:** Reads `/proc/net/tcp` and `/proc/net/tcp6` directly in pure Python, tracking `ESTABLISHED`, `SYN_RECV`, `CLOSE_WAIT`, and `rx_queue`/`tx_queue` byte depths, with automatic `1-in-16` stride sampling above `--max-exact-sockets` (`50000`) so floods do not exhaust analysis RAM/CPU.
-* **Built-In Adaptive Shield Engine & Active Enforcement (`--enforce-shield`):** Combines a 3-state attack hysteresis hold (`--hysteresis-seconds`), anonymized HMAC-bucket Shannon entropy flood-shape classification (`CONCENTRATED_SOURCE` vs `DISTRIBUTED_BOTNET`), bounded 64-tick ring history, `torrc` `DoSBeginDir*` / Equi-X PoW & kernel `sk_buff` (`net.core.high_order_alloc_disable=1`) guidance, atomic dual-stack consensus-safe `nftables` (`--emit-nft-consensus`), `bpftool` XDP map sync (`--emit-xdp-sync`), and a compilable dual-stack `eBPF/XDP` SYN token-bucket shield (`--emit-xdp-c`). When started with `--enforce-shield`, `ShieldController` syncs consensus allowlists, blocks verified high-socket flooders (`--ban-ttl`, strictly skipping Consensus relays and `--allow-cidr`), and flushes temporary bans after hysteresis recovery (`--shield-dry-run` supported without kernel mutation).
+* **Zero-Subprocess Kernel Socket Telemetry & Overload Stride:** Reads `/proc/net/tcp` and `/proc/net/tcp6` directly in pure Python (64 MiB read cap), tracking active `ESTABLISHED`, `SYN_SENT`, and `SYN_RECV` sockets (excluding `LISTEN`, `TIME_WAIT`, and closing states) and `rx_queue`/`tx_queue` byte depths, with automatic `1-in-16` stride sampling above `--max-exact-sockets` (`50000`) and a minimum raw sample floor so low-socket clients are never misattributed under overload.
+* **Built-In Adaptive Shield Engine & Active Enforcement (`--enforce-shield`):** Combines a 3-state attack hysteresis hold (`--hysteresis-seconds`), anonymized HMAC-bucket Shannon entropy flood-shape classification (`CONCENTRATED_SOURCE` vs `DISTRIBUTED_BOTNET`), bounded 64-tick ring history, `torrc` `DoSBeginDir*` / Equi-X PoW & kernel `sk_buff` (`net.core.high_order_alloc_disable=1`) guidance, atomic per-IP dual-stack consensus-safe `nftables` (`--emit-nft-consensus`), `bpftool` XDP map sync (`--emit-xdp-sync`), and a compilable dual-stack `eBPF/XDP` SYN token-bucket shield (`--emit-xdp-c`). When started with `--enforce-shield`, `ShieldController` refreshes Consensus allowlists in `--watch` mode, blocks verified high-socket flooders (`--ban-ttl`, strictly skipping Consensus relays, loopback, and `--allow-cidr` — full CIDRs in `nft` interval sets and `/32`/`/128` hosts in XDP maps), and flushes temporary bans on recovery (`--shield-dry-run` evaluates logic locally without requiring root or invoking `nft`/`bpftool`).
 * **Tor `MetricsPort` & Thunderstorm Integration:** Parses official Prometheus counters (`tor_relay_connections`, `tor_relay_load_onionskins_total`, `tor_relay_load_oom_bytes_total`, `tor_relay_load_socket_total`, `tor_relay_load_tcp_exhaustion*`, `tor_relay_dos_total{type="begindir_*|circuit_*|conn_rejected"}`, and `tor_relay_streams_total{cmd="BEGIN_DIR"}`) with non-crashing timeout resilience (`--metrics-timeout` -> `METRICS_PORT_UNRESPONSIVE`) and half-open `BEGIN_DIR` event-loop stall detection (`HALF_OPEN_BEGIN_DIR_BYPASS_SUSPECTED`).
-* **Tor `ControlPort` Cross-Check:** Supports bounded 32-byte cookie/password authentication to fetch `GETINFO orconn-status` and correlate live peer OR circuits.
-* **Consensus Relay & Family Rollup:** Indexes field-filtered Onionoo `/details` (compressed via `gzip`, supporting `--proxy`, `--no-cache` amnesic mode, atomic `0600` cache files reused for a 1-hour TTL, and `--refresh` to force a live reload) **or** a relay's own local `cached-consensus` (`--consensus-file /var/lib/tor/cached-consensus`) to group relay flood traffic individually and by `effective_family` or `AS + /24`.
+* **Tor `ControlPort` Cross-Check:** Supports bounded 32-byte cookie authentication (`--control-cookie` / `--control-port`) to fetch `GETINFO orconn-status` and correlate live peer OR circuits.
+* **Consensus Relay & Family Rollup:** Indexes field-filtered Onionoo `/details` (compressed via `gzip`, supporting `--proxy`, `--no-cache` amnesic mode, atomic `0600` cache files reused for a 1-hour TTL, and `--refresh` to force a live reload) to group relays by `effective_family` or `AS + /24` — **or** a relay's local v3 `cached-consensus` (`--consensus-file /var/lib/tor/cached-consensus`, which requires `debian-tor`/root read access and groups relays under `AS_LOCAL` + `/24` because Tor v3 consensus files omit ASN and family metadata).
 * **Zero Runtime Dependencies:** Pure Python 3.10+ standard library.
 
 ---
@@ -67,30 +67,33 @@ Run a live triage pass (all non-relay IPs masked with ephemeral session HMAC):
 *Note: Only non-relay peers holding `>= 25` concurrent sockets are revealed in live terminal output; consensus relays are flagged with Fingerprint/ASN/`effective_family` rather than global firewall blocks so Tor mesh routing is not partitioned.*
 
 ### 4. Built-In Adaptive Enforcement (`nftables` or `XDP/eBPF`)
-Dry-run the built-in shield locally against live consensus + kernel sockets without modifying firewall state:
+Dry-run the built-in shield locally against live consensus + kernel sockets without modifying firewall state (non-relay IPs stay HMAC-masked unless `--reveal-flooders` is also passed):
 ```bash
 ./bin/relaysentry --port 9001 --port 9030 --enforce-shield --shield-dry-run --watch 5
 ```
 
-Enforce live via `nftables` (`known_relays4`/`known_relays6` + auto-expiring `tor_ddos4`/`tor_ddos6`, SSH/management & Tor relays stay untouched):
+Smoke-check the generated `nftables` ruleset against your live kernel (`CAP_NET_ADMIN` / `sudo`, `nftables >= 0.9.3`, `nf_conntrack` module loaded) before applying:
 ```bash
-sudo ./bin/relaysentry --port 9001 --port 9030 --enforce-shield --shield-backend nft --ban-ttl 1800 --watch 5
+./bin/relaysentry --port 9001 --port 9030 --allow-cidr 198.51.100.0/24 --emit-nft-consensus | sudo nft -c -f -
+./bin/relaysentry --port 9001 --port 9030 --allow-cidr 198.51.100.0/24 --emit-nft-consensus | sudo nft -f -
 ```
 
-Or deploy the dual-stack XDP/eBPF NIC-ring filter (`bpftool` map sync + `--enforce-shield --shield-backend xdp`):
+Enforce live via `nftables` (`allow_net4/6` + `known_relays4/6` + per-IP dynamic `tor_syn4/6` + auto-expiring `tor_ddos4/6`; Tor relays, loopback, and `--allow-cidr` stay exempt):
+```bash
+sudo ./bin/relaysentry --port 9001 --port 9030 --allow-cidr 198.51.100.0/24 --enforce-shield --shield-backend nft --ban-ttl 1800 --watch 5
+```
+
+Or deploy the dual-stack XDP/eBPF NIC-ring filter (requires `clang`, `libbpf-dev`, kernel headers, `bpftool >= 5.9`, mounted `bpffs` at `/sys/fs/bpf`, and NIC driver XDP support; replace `<IFACE>` with your external interface name):
 ```bash
 ./bin/relaysentry --port 9001 --port 9030 --emit-xdp-c > relaysentry_xdp.c
-clang -O2 -g -target bpf -c relaysentry_xdp.c -o relaysentry_xdp.o
+clang -O2 -g -target bpf -I/usr/include/$(uname -m)-linux-gnu -c relaysentry_xdp.c -o relaysentry_xdp.o
 sudo bpftool prog load relaysentry_xdp.o /sys/fs/bpf/relaysentry_xdp_prog pinmaps /sys/fs/bpf/relaysentry
-sudo bpftool net attach xdp pinned /sys/fs/bpf/relaysentry_xdp_prog dev eth0
-./bin/relaysentry --port 9001 --emit-xdp-sync | sudo bpftool batch file -
+sudo bpftool net attach xdp pinned /sys/fs/bpf/relaysentry_xdp_prog dev <IFACE>
+./bin/relaysentry --port 9001 --port 9030 --emit-xdp-sync | sudo bpftool batch file -
 sudo ./bin/relaysentry --port 9001 --port 9030 --enforce-shield --shield-backend xdp --watch 5
 ```
 
-You can also export standalone `nftables` consensus rules cleanly:
-```bash
-./bin/relaysentry --port 9001 --port 9030 --emit-nft-consensus | sudo nft -f -
-```
+*Note: Root `sudo` runs cache Onionoo JSON under `/root/.cache/relaysentry/`, whereas unprivileged dry-runs cache under `$HOME/.cache/relaysentry/`. On hardened hosts without `nf_conntrack`, use `--shield-backend xdp` instead of `conntrack`-based nftables rules.*
 
 ---
 
@@ -104,5 +107,6 @@ You can also export standalone `nftables` consensus rules cleanly:
 * [`src/correlator.py`](src/correlator.py) — Multi-signal DoS triage & family/AS rollup engine
 * [`src/shield_engine.py`](src/shield_engine.py) — Hysteresis, entropy flood classifier, consensus `nft` allowlist, `torrc` PoW & XDP/eBPF C shield
 * [`doc/THREAT_MODEL_AND_SPECS.md`](doc/THREAT_MODEL_AND_SPECS.md) — Architectural & Tor specification ground truth
+* [`doc/ENGINEERING_STORY.md`](doc/ENGINEERING_STORY.md) — Build, Thunderstorm reconstruction & dual Goldfish hostile audit story
 * [`test/verify_relaysentry.py`](test/verify_relaysentry.py) — 10-suite offline + loopback sandbox testbench
 * [`test/simulate_thunderstorm.py`](test/simulate_thunderstorm.py) — 4-stage live Thunderstorm & half-open bypass simulator

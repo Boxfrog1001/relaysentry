@@ -312,8 +312,12 @@ def load_consensus_index(
     if not no_cache and cache_path.exists():
         age = time.time() - cache_path.stat().st_mtime
         if offline or (not refresh and age < cache_ttl_seconds):
-            raw_bytes = _read_bounded_file(cache_path, MAX_CONSENSUS_BYTES, "Cached consensus file")
-            return ConsensusIndex.from_onionoo_payload(json.loads(raw_bytes.decode("utf-8")))
+            try:
+                raw_bytes = _read_bounded_file(cache_path, MAX_CONSENSUS_BYTES, "Cached consensus file")
+                return ConsensusIndex.from_onionoo_payload(json.loads(raw_bytes.decode("utf-8")))
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                if offline:
+                    raise
 
     if offline:
         return ConsensusIndex({}, {})

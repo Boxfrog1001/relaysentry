@@ -50,6 +50,11 @@ class EphemeralPrivacyVault:
         self._reveal_flooders = bool(reveal_flooders)
         self._flood_threshold = int(flood_threshold)
 
+    @property
+    def reveal_flooders(self) -> bool:
+        """Whether flooder disclosure above flood_threshold is enabled."""
+        return self._reveal_flooders
+
     def anonymize_ip(self, canonical_ip: str) -> str:
         """Return deterministic-within-session anon#<16-hex> token."""
         addr_bytes = ipaddress.ip_address(canonical_ip).packed

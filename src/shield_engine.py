@@ -140,15 +140,12 @@ def generate_kernel_nft_rules(
             continue
         proto = "ip6 saddr" if addr.version == 6 else "ip saddr"
         port_expr = ", ".join(str(p) for p in valid_ports)
-        # Skip nf_conntrack state creation on known flooders, then drop excess new SYNs early.
+        # Self-contained per-IP rate-limit hint (does not require pre-existing inet raw/filter tables).
         hints.append(
-            f"nft add rule inet raw prerouting {proto} {addr.compressed} "
-            f"tcp dport {{ {port_expr} }} notrack"
-        )
-        hints.append(
-            f"nft add rule inet filter input {proto} {addr.compressed} "
-            f"tcp dport {{ {port_expr} }} ct state new,untracked "
-            f"limit rate over {rate_limit} burst {burst} packets drop  # review TTL={ttl_seconds}s"
+            f"nft add table inet relaysentry_hints && "
+            f"nft 'add chain inet relaysentry_hints input {{ type filter hook input priority filter; policy accept; }}' && "
+            f"nft 'add rule inet relaysentry_hints input {proto} {addr.compressed} "
+            f"tcp dport {{ {port_expr} }} ct state new limit rate over {rate_limit} burst {burst} packets drop'  # review TTL={ttl_seconds}s"
         )
     return hints
 
@@ -174,7 +171,7 @@ def generate_tor_defense_hints(
     if "HALF_OPEN_BEGIN_DIR_BYPASS_SUSPECTED" in reason_text or "METRICS_PORT_UNRESPONSIVE" in reason_text:
         hints.append(
             "Event-loop / half-open BEGIN_DIR stall detected: kernel socket queues are filling before "
-            "HTTP GET completion; isolate non-relay flooders early via XDP/nftables notrack and monitor procfs directly."
+            "HTTP GET completion; isolate non-relay flooders early via XDP/nftables and monitor procfs directly."
         )
 
     if "ONIONSKIN_DROPS" in reason_text or "TOR_OOM_TRIGGERED" in reason_text:
@@ -222,8 +219,9 @@ def generate_nft_consensus_sync(
     rate_limit: str = "10/second",
     burst: int = 20,
     ban_timeout: str = "30m",
+    allow_cidrs: Iterable[str] = (),
 ) -> str:
-    """Emit atomic nftables consensus allowlist + non-relay DoS rate-limit script (operator-reviewed)."""
+    """Emit atomic, idempotent nftables consensus & --allow-cidr allowlist + per-IP DoS shield."""
     sorted_ports = [p for p in sorted(ports) if 1 <= p <= 65535]
     if not sorted_ports:
         raise ValueError("At least one valid TCP port (1..65535) is required")
@@ -241,13 +239,39 @@ def generate_nft_consensus_sync(
         else:
             v6_ips.append(addr.compressed)
 
+    allow_v4: list[str] = ["127.0.0.0/8"]
+    allow_v6: list[str] = ["::1/128"]
+    for raw_cidr in allow_cidrs:
+        if not raw_cidr or not str(raw_cidr).strip():
+            continue
+        try:
+            net = ipaddress.ip_network(str(raw_cidr).strip(), strict=False)
+        except ValueError:
+            continue
+        if net.version == 4:
+            allow_v4.append(net.compressed)
+        else:
+            allow_v6.append(net.compressed)
+
     v4_sorted = sorted(set(v4_ips))
     v6_sorted = sorted(set(v6_ips))
+    allow_v4_sorted = sorted(set(allow_v4))
+    allow_v6_sorted = sorted(set(allow_v6))
     lines = [
         "#!/usr/sbin/nft -f",
-        "# RelaySentry Consensus-Safe ORPort Shield (preserves all known Tor relays & Authorities)",
+        "# RelaySentry Consensus-Safe ORPort Shield (preserves all known Tor relays & --allow-cidr)",
         f"# Apply atomically: ./bin/relaysentry --port {sorted_ports[0]} --emit-nft-consensus | sudo nft -f -",
+        "add table inet relaysentry_shield",
+        "delete table inet relaysentry_shield",
         "table inet relaysentry_shield {",
+        "    set allow_net4 {",
+        "        type ipv4_addr",
+        "        flags interval",
+        "    }",
+        "    set allow_net6 {",
+        "        type ipv6_addr",
+        "        flags interval",
+        "    }",
         "    set known_relays4 {",
         "        type ipv4_addr",
         "    }",
@@ -266,33 +290,57 @@ def generate_nft_consensus_sync(
         "        flags dynamic, timeout",
         f"        timeout {ban_timeout}",
         "    }",
+        "    set tor_syn4 {",
+        "        type ipv4_addr",
+        "        size 65536",
+        "        flags dynamic, timeout",
+        "        timeout 60s",
+        "    }",
+        "    set tor_syn6 {",
+        "        type ipv6_addr",
+        "        size 65536",
+        "        flags dynamic, timeout",
+        "        timeout 60s",
+        "    }",
         "    set connlimit4 {",
         "        type ipv4_addr",
         "        size 65536",
-        "        flags dynamic",
+        "        flags dynamic, timeout",
+        "        timeout 120s",
         "    }",
         "    set connlimit6 {",
         "        type ipv6_addr",
         "        size 65536",
-        "        flags dynamic",
+        "        flags dynamic, timeout",
+        "        timeout 120s",
         "    }",
         "    chain input {",
         "        type filter hook input priority filter; policy accept;",
         "    }",
         "}",
         "flush chain inet relaysentry_shield input",
+        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip saddr @allow_net4 accept",
+        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip6 saddr @allow_net6 accept",
         f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip saddr @known_relays4 accept",
         f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip6 saddr @known_relays6 accept",
         f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip saddr @tor_ddos4 drop",
         f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ip6 saddr @tor_ddos6 drop",
-        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip saddr != @known_relays4 limit rate over {rate_limit} burst {burst} packets add @tor_ddos4 {{ ip saddr }} drop",
-        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip6 saddr != @known_relays6 limit rate over {rate_limit} burst {burst} packets add @tor_ddos6 {{ ip6 saddr }} drop",
+        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip saddr != @known_relays4 add @tor_syn4 {{ ip saddr limit rate over {rate_limit} burst {burst} packets }} add @tor_ddos4 {{ ip saddr }} drop",
+        f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip6 saddr != @known_relays6 add @tor_syn6 {{ ip6 saddr limit rate over {rate_limit} burst {burst} packets }} add @tor_ddos6 {{ ip6 saddr }} drop",
         f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip saddr != @known_relays4 add @connlimit4 {{ ip saddr ct count over {conn_limit} }} drop",
         f"add rule inet relaysentry_shield input tcp dport {{ {port_expr} }} ct state new ip6 saddr != @known_relays6 add @connlimit6 {{ ip6 saddr ct count over {conn_limit} }} drop",
+        "flush set inet relaysentry_shield allow_net4",
+        "flush set inet relaysentry_shield allow_net6",
         "flush set inet relaysentry_shield known_relays4",
         "flush set inet relaysentry_shield known_relays6",
     ]
     chunk_size = 256
+    for idx in range(0, len(allow_v4_sorted), chunk_size):
+        chunk = ", ".join(allow_v4_sorted[idx : idx + chunk_size])
+        lines.append(f"add element inet relaysentry_shield allow_net4 {{ {chunk} }}")
+    for idx in range(0, len(allow_v6_sorted), chunk_size):
+        chunk = ", ".join(allow_v6_sorted[idx : idx + chunk_size])
+        lines.append(f"add element inet relaysentry_shield allow_net6 {{ {chunk} }}")
     for idx in range(0, len(v4_sorted), chunk_size):
         chunk = ", ".join(v4_sorted[idx : idx + chunk_size])
         lines.append(f"add element inet relaysentry_shield known_relays4 {{ {chunk} }}")
@@ -450,14 +498,14 @@ struct {{
 }} blocked_v6 SEC(".maps");
 
 struct {{
-    __uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 131072);
     __type(key, __be32);
     __type(value, struct bucket_state);
 }} syn_bucket_v4 SEC(".maps");
 
 struct {{
-    __uint(type, BPF_MAP_TYPE_LRU_PERCPU_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 131072);
     __type(key, struct ipv6_key);
     __type(value, struct bucket_state);
@@ -538,9 +586,33 @@ int relaysentry_xdp_shield(struct xdp_md *ctx) {{
 
     if (proto == bpf_htons(ETH_P_IPV6)) {{
         struct ipv6hdr *ip6h = l3;
-        if ((void *)(ip6h + 1) > data_end || ip6h->nexthdr != IPPROTO_TCP)
+        if ((void *)(ip6h + 1) > data_end)
             return XDP_PASS;
-        struct tcphdr *tcph = (void *)(ip6h + 1);
+        __u8 nexthdr = ip6h->nexthdr;
+        void *l4 = (void *)(ip6h + 1);
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {{
+            if (nexthdr == IPPROTO_TCP)
+                break;
+            if (nexthdr == 0 || nexthdr == 43 || nexthdr == 60) {{
+                struct ipv6_opt_hdr *opt = l4;
+                if ((void *)(opt + 1) > data_end)
+                    return XDP_PASS;
+                nexthdr = opt->nexthdr;
+                l4 = (void *)((unsigned char *)opt + ((opt->hdrlen + 1) * 8));
+            }} else if (nexthdr == 44) {{
+                struct frag_hdr *frag = l4;
+                if ((void *)(frag + 1) > data_end)
+                    return XDP_PASS;
+                nexthdr = frag->nexthdr;
+                l4 = (void *)(frag + 1);
+            }} else {{
+                return XDP_PASS;
+            }}
+        }}
+        if (nexthdr != IPPROTO_TCP)
+            return XDP_PASS;
+        struct tcphdr *tcph = l4;
         if ((void *)(tcph + 1) > data_end)
             return XDP_PASS;
 
@@ -608,14 +680,37 @@ class ShieldEnforcementSummary:
 
 def _default_command_runner(argv: list[str], stdin_payload: str) -> None:
     """Execute privileged nftables or bpftool batch safely without a shell."""
-    subprocess.run(
+    proc = subprocess.run(
         argv,
         input=stdin_payload,
         text=True,
         capture_output=True,
-        check=True,
+        check=False,
         timeout=15,
     )
+    if proc.returncode == 0:
+        return
+    # bpftool batch aborts on map delete ENOENT if LRU_HASH already evicted the key;
+    # fall back to per-line execution ignoring ENOENT on map delete so bans never deadlock.
+    if argv and argv[0] == "bpftool" and "No such file or directory" in (proc.stderr or ""):
+        for line in stdin_payload.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            sub = subprocess.run(
+                ["bpftool", *parts],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            if sub.returncode != 0:
+                if parts[:2] == ["map", "delete"] and "No such file or directory" in (sub.stderr or ""):
+                    continue
+                raise subprocess.CalledProcessError(sub.returncode, ["bpftool", *parts], sub.stdout, sub.stderr)
+        return
+    raise subprocess.CalledProcessError(proc.returncode, argv, proc.stdout, proc.stderr)
 
 
 class ShieldController:
@@ -667,7 +762,20 @@ class ShieldController:
         )
         self.active_bans: dict[str, float] = {}
         self._last_consensus_sync: float | None = None
+        self._had_non_normal: bool = False
         self.last_summary: ShieldEnforcementSummary | None = None
+
+    def update_consensus(self, consensus_ips: Iterable[str]) -> None:
+        """Refresh the in-memory Consensus allowlist and schedule immediate kernel re-sync."""
+        refreshed: set[str] = set()
+        for raw_ip in consensus_ips:
+            try:
+                refreshed.add(ipaddress.ip_address(raw_ip).compressed)
+            except ValueError:
+                continue
+        if refreshed != self.consensus_ips:
+            self.consensus_ips = refreshed
+            self._last_consensus_sync = None
 
     def _resolve_backend(self, requested: str) -> str:
         if requested != "auto":
@@ -728,9 +836,14 @@ class ShieldController:
                     self.ports,
                     conn_limit=self.flood_threshold,
                     ban_timeout=f"{self.ban_ttl_seconds}s",
+                    allow_cidrs=[str(n) for n in self.allow_networks],
                 )
             else:
-                chunk = generate_xdp_map_sync(self.consensus_ips, pin_dir=self.bpf_pin_dir)
+                xdp_allow = set(self.consensus_ips)
+                for net in self.allow_networks:
+                    if net.prefixlen == net.max_prefixlen:
+                        xdp_allow.add(net.network_address.compressed)
+                chunk = generate_xdp_map_sync(xdp_allow, pin_dir=self.bpf_pin_dir)
             payload_chunks.append(chunk)
             new_sync_ts = now
             consensus_synced = True
@@ -741,21 +854,29 @@ class ShieldController:
         cleared_count = 0
         if effective_severity == "NORMAL":
             to_clear = sorted(set(staged_bans.keys()) | set(expired_ips))
-            if to_clear:
+            if to_clear or self._had_non_normal:
                 if self.backend == "nft":
-                    if any(":" not in ip for ip in to_clear):
+                    if to_clear:
+                        if any(":" not in ip for ip in to_clear):
+                            payload_chunks.append("flush set inet relaysentry_shield tor_ddos4")
+                        if any(":" in ip for ip in to_clear):
+                            payload_chunks.append("flush set inet relaysentry_shield tor_ddos6")
+                    else:
                         payload_chunks.append("flush set inet relaysentry_shield tor_ddos4")
-                    if any(":" in ip for ip in to_clear):
                         payload_chunks.append("flush set inet relaysentry_shield tor_ddos6")
-                else:
+                elif to_clear:
                     payload_chunks.append(
                         generate_xdp_map_sync((), pin_dir=self.bpf_pin_dir, unblock_ips=to_clear)
                     )
                 cleared_count = len(to_clear)
                 staged_bans.clear()
+                self._had_non_normal = False
         elif expired_ips and self.backend == "xdp":
             payload_chunks.append(generate_xdp_map_sync((), pin_dir=self.bpf_pin_dir, unblock_ips=expired_ips))
             cleared_count = len(expired_ips)
+
+        if effective_severity != "NORMAL":
+            self._had_non_normal = True
 
         added_bans: list[str] = []
         skipped_protected = 0

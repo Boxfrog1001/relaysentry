@@ -103,21 +103,26 @@ def parse_prometheus_metrics(text: str) -> TorMetricsSnapshot:
         val = float(raw_val)
         labels = _parse_labels(raw_labels)
 
+        try:
+            ival = int(val)
+        except (ValueError, OverflowError):
+            continue
+
         if name in ("tor_relay_connections", "tor_relay_connections_total"):
             if labels.get("state") == "opened":
                 conn_type = labels.get("type", "").lower()
                 if "listener" in conn_type:
                     continue
-                snap.connections_opened += int(val)
+                snap.connections_opened += ival
                 if conn_type == "directory":
-                    snap.dir_connections_opened += int(val)
+                    snap.dir_connections_opened += ival
                 elif conn_type == "or":
-                    snap.or_connections_opened += int(val)
+                    snap.or_connections_opened += ival
         elif name == "tor_relay_load_onionskins_total":
             otype = labels.get("type", "")
             action = labels.get("action", "")
             if otype == "ntor" and action == "processed":
-                snap.ntor_processed += int(val)
+                snap.ntor_processed += ival
             elif otype == "ntor" and action == "dropped":
                 snap.ntor_dropped += int(val)
             elif otype == "ntor_v3" and action == "processed":

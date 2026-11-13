@@ -131,6 +131,7 @@ class TriageReport:
     tor_defense_hints: tuple[str, ...] = ()
     metrics_unresponsive: bool = False
     control_unresponsive: bool = False
+    heavy_nonrelay_ips: tuple[str, ...] = ()
 
 
 def _family_cluster_key(meta: RelayMeta) -> tuple[str, str]:
@@ -212,6 +213,7 @@ def correlate_triage(
     nonrelay_peers: list[NonRelayPeerReport] = []
     cluster_buckets: dict[tuple[str, str], list[RelayAttribution]] = {}
     disclosed_flooders: list[tuple[str, tuple[int, ...]]] = []
+    heavy_nonrelay_ips: list[str] = []
 
     consensus_sockets = 0
     nonrelay_sockets = 0
@@ -250,9 +252,12 @@ def correlate_triage(
         else:
             est_nonrelay = agg.total_sockets * stride
             nonrelay_sockets += est_nonrelay
-            # Under 1-in-N overload sampling, require >= 2 raw samples so 1-socket clients never reveal.
-            reveal_count = est_nonrelay if (stride == 1 or agg.total_sockets >= 2) else 0
-            peer_label = vault.classify_nonrelay(remote_ip, reveal_count)
+            # Under 1-in-N overload sampling, require >= 3 raw samples so 1-2 socket clients never reveal/ban.
+            min_stride_samples = max(3, (flood_threshold // stride) + 1)
+            threshold_count = est_nonrelay if (stride == 1 or agg.total_sockets >= min_stride_samples) else 0
+            if threshold_count >= flood_threshold:
+                heavy_nonrelay_ips.append(remote_ip)
+            peer_label = vault.classify_nonrelay(remote_ip, threshold_count)
             display = peer_label.disclosed_ip if peer_label.disclosed_ip else peer_label.token
             nonrelay_peers.append(
                 NonRelayPeerReport(
@@ -435,4 +440,5 @@ def correlate_triage(
         tor_defense_hints=tuple(tor_hints),
         metrics_unresponsive=metrics_unresponsive,
         control_unresponsive=control_unresponsive,
+        heavy_nonrelay_ips=tuple(heavy_nonrelay_ips),
     )

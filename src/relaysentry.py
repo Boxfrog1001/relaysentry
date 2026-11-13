@@ -3,6 +3,7 @@
 
 import argparse
 import http.client
+import ipaddress
 import json
 import subprocess
 import sys
@@ -15,7 +16,7 @@ SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from consensus_index import ConsensusIndex, load_consensus_index
+from consensus_index import DEFAULT_CACHE_TTL_SECONDS, ConsensusIndex, load_consensus_index
 from correlator import TriageReport, correlate_triage
 from privacy_vault import EphemeralPrivacyVault
 from shield_engine import (
@@ -51,6 +52,7 @@ def _validate_ports(raw_ports: list[int]) -> set[int]:
 def _report_to_dict(
     report: TriageReport,
     shield_status: ShieldEnforcementSummary | None = None,
+    vault: EphemeralPrivacyVault | None = None,
 ) -> dict:
     """Serialize report safely (non-consensus peers use masked tokens unless revealed above threshold)."""
     data = {
@@ -135,7 +137,10 @@ def _report_to_dict(
         "tor_defense_hints": list(report.tor_defense_hints),
     }
     if shield_status is not None:
-        data["shield_enforcement"] = shield_status.to_dict()
+        sd = shield_status.to_dict()
+        if vault is not None and not vault.reveal_flooders:
+            sd["added_bans"] = [vault.anonymize_ip(ip) for ip in sd["added_bans"]]
+        data["shield_enforcement"] = sd
     return data
 
 
@@ -143,6 +148,7 @@ def format_terminal_report(
     report: TriageReport,
     top_n: int = 10,
     shield_status: ShieldEnforcementSummary | None = None,
+    vault: EphemeralPrivacyVault | None = None,
 ) -> str:
     """Format a clean human-readable triage report for terminal display."""
     lines: list[str] = []
@@ -183,7 +189,11 @@ def format_terminal_report(
         lines.append(f" TELEMETRY_STALL: {', '.join(stalled)} timed out/refused (continuing procfs triage)")
     if shield_status is not None:
         mode = f"{shield_status.backend}:DRY-RUN" if shield_status.dry_run else shield_status.backend.upper()
-        bans_note = ",".join(shield_status.added_bans[:5]) if shield_status.added_bans else "none"
+        if vault is not None and not vault.reveal_flooders:
+            shown_bans = [vault.anonymize_ip(ip) for ip in shield_status.added_bans[:5]]
+        else:
+            shown_bans = list(shield_status.added_bans[:5])
+        bans_note = ",".join(shown_bans) if shown_bans else "none"
         lines.append(
             f" SHIELD [{mode}]: active_bans={shield_status.active_ban_count} "
             f"| added=({bans_note}) | cleared={shield_status.cleared_bans} "
@@ -398,7 +408,7 @@ def run_once(
     if args.metrics_url:
         try:
             curr_metrics = fetch_metrics_port(args.metrics_url, timeout=telemetry_timeout)
-        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException, ValueError, OverflowError) as exc:
             metrics_unresponsive = True
             print(
                 f"[WARN] MetricsPort unresponsive ({exc.__class__.__name__}: {exc}); continuing procfs triage",
@@ -415,7 +425,7 @@ def run_once(
                 cookie_path=args.control_cookie,
                 timeout=telemetry_timeout,
             )
-        except (TimeoutError, OSError) as exc:
+        except (TimeoutError, OSError, ValueError) as exc:
             if isinstance(exc, PermissionError) and "EOF" not in str(exc):
                 raise
             control_unresponsive = True
@@ -440,7 +450,7 @@ def run_once(
         control_unresponsive=control_unresponsive,
     )
     if shield_controller is not None:
-        candidate_ips = [p.label for p in report.nonrelay_peers if not p.masked]
+        candidate_ips = list(report.heavy_nonrelay_ips)
         try:
             shield_controller.reconcile(report.effective_severity, candidate_ips)
         except (subprocess.SubprocessError, OSError) as exc:
@@ -497,16 +507,27 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     vault = EphemeralPrivacyVault(
-        reveal_flooders=bool(args.reveal_flooders or args.enforce_shield),
+        reveal_flooders=bool(args.reveal_flooders),
         flood_threshold=args.flood_threshold,
     )
-    consensus = load_consensus_index(
-        consensus_file=args.consensus_file,
-        no_cache=args.no_cache,
-        offline=args.offline,
-        proxy_url=args.proxy,
-        refresh=args.refresh,
-    )
+    try:
+        consensus = load_consensus_index(
+            consensus_file=args.consensus_file,
+            no_cache=args.no_cache,
+            offline=args.offline,
+            proxy_url=args.proxy,
+            refresh=args.refresh,
+        )
+    except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
+        print(f"[ERROR] Failed to load Tor Consensus index: {exc}", file=sys.stderr)
+        return 2
+    if args.enforce_shield and not args.shield_dry_run and not consensus.ip_to_fps:
+        print(
+            "[ERROR] Refusing to run live --enforce-shield with an empty Consensus allowlist "
+            "(provide --consensus-file or remove --offline).",
+            file=sys.stderr,
+        )
+        return 2
     if args.emit_nft_consensus:
         _safe_stdout(
             generate_nft_consensus_sync(
@@ -514,36 +535,81 @@ def main(argv: list[str] | None = None) -> int:
                 ports,
                 conn_limit=args.flood_threshold,
                 ban_timeout=f"{args.ban_ttl}s",
+                allow_cidrs=args.allow_cidr,
             )
         )
         return 0
     if args.emit_xdp_sync:
-        _safe_stdout(
-            generate_xdp_map_sync(
-                consensus.ip_to_fps.keys(),
-                pin_dir=args.bpf_pin_dir,
+        xdp_allow = set(consensus.ip_to_fps.keys())
+        for raw_cidr in args.allow_cidr:
+            if not raw_cidr or not raw_cidr.strip():
+                continue
+            try:
+                net = ipaddress.ip_network(raw_cidr.strip(), strict=False)
+                if net.prefixlen == net.max_prefixlen:
+                    xdp_allow.add(net.network_address.compressed)
+            except ValueError as exc:
+                print(f"[ERROR] Invalid --allow-cidr {raw_cidr!r}: {exc}", file=sys.stderr)
+                return 2
+        try:
+            _safe_stdout(
+                generate_xdp_map_sync(
+                    xdp_allow,
+                    pin_dir=args.bpf_pin_dir,
+                )
             )
-        )
+        except ValueError as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            return 2
         return 0
 
     shield_controller: ShieldController | None = None
     if args.enforce_shield:
-        shield_controller = ShieldController(
-            ports=ports,
-            consensus_ips=consensus.ip_to_fps.keys(),
-            backend=args.shield_backend,
-            dry_run=args.shield_dry_run,
-            ban_ttl_seconds=args.ban_ttl,
-            flood_threshold=args.flood_threshold,
-            bpf_pin_dir=args.bpf_pin_dir,
-            allow_cidrs=args.allow_cidr,
-        )
+        try:
+            shield_controller = ShieldController(
+                ports=ports,
+                consensus_ips=consensus.ip_to_fps.keys(),
+                backend=args.shield_backend,
+                dry_run=args.shield_dry_run,
+                ban_ttl_seconds=args.ban_ttl,
+                flood_threshold=args.flood_threshold,
+                bpf_pin_dir=args.bpf_pin_dir,
+                allow_cidrs=args.allow_cidr,
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(f"[ERROR] Shield initialization failed: {exc}", file=sys.stderr)
+            return 2
 
     state_machine = DefenseStateMachine(hold_seconds=args.hysteresis_seconds)
     ring_buffer = TelemetryRingBuffer(maxlen=64)
     prev_metrics: TorMetricsSnapshot | None = None
+    last_consensus_refresh = time.monotonic()
     try:
         while True:
+            now_tick = time.monotonic()
+            if (
+                args.watch > 0
+                and not args.offline
+                and (now_tick - last_consensus_refresh) >= DEFAULT_CACHE_TTL_SECONDS
+            ):
+                try:
+                    consensus = load_consensus_index(
+                        consensus_file=args.consensus_file,
+                        no_cache=args.no_cache,
+                        offline=False,
+                        proxy_url=args.proxy,
+                        refresh=args.consensus_file is None,
+                    )
+                    if shield_controller is not None:
+                        shield_controller.update_consensus(consensus.ip_to_fps.keys())
+                    last_consensus_refresh = now_tick
+                except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
+                    print(
+                        f"[WARN] Periodic Consensus refresh failed ({exc.__class__.__name__}: {exc}); keeping existing allowlist",
+                        file=sys.stderr,
+                    )
+                    last_consensus_refresh = now_tick - (DEFAULT_CACHE_TTL_SECONDS - 300)
+
             report, prev_metrics = run_once(
                 ports,
                 consensus,
@@ -556,9 +622,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             shield_summary = shield_controller.last_summary if shield_controller is not None else None
             out_text = (
-                json.dumps(_report_to_dict(report, shield_status=shield_summary), indent=2)
+                json.dumps(_report_to_dict(report, shield_status=shield_summary, vault=vault), indent=2)
                 if args.json
-                else format_terminal_report(report, shield_status=shield_summary)
+                else format_terminal_report(report, shield_status=shield_summary, vault=vault)
             )
             if not _safe_stdout(out_text):
                 return 0
