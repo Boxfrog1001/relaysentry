@@ -2,6 +2,9 @@
 
 **Privacy-preserving real-time DoS triage and consensus peer attribution for Tor relay operators.**
 
+> [!NOTE]
+> **Community Tool — Early Work & Call for Input:** `RelaySentry` is a community-driven effort I started to give Tor relay operators practical DoS visibility and kernel/XDP mitigation without compromising user privacy. A lot more work, multi-distro/live-relay testing, and peer review are still needed — feedback, bug reports, kernel/network edge cases, and PRs from relay operators and Tor developers are actively needed and welcome.
+
 `RelaySentry` correlates Linux kernel socket tables (`/proc/net/tcp`, `/proc/net/tcp6`), Tor's local Prometheus `MetricsPort`, and optional `ControlPort` (`GETINFO orconn-status`) telemetry against the public Tor Consensus — giving `Guard`, `Middle`, `Exit`, and `HSDir` operators immediate visibility during `BEGIN_DIR`, `CREATE2`, or `SYN` floods **without logging honest Tor client IPs**.
 
 ---
