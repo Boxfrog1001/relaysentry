@@ -440,12 +440,20 @@ def run_once(
                 file=sys.stderr,
             )
 
+    effective_prev_metrics = prev_metrics
+    if getattr(args, "watch", 0.0) > 0 and prev_metrics is None and curr_metrics is not None:
+        effective_prev_metrics = curr_metrics
+        print(
+            "[INFO] Watch baseline established for Tor MetricsPort cumulative counters; interval deltas begin on next tick.",
+            file=sys.stderr,
+        )
+
     report = correlate_triage(
         sockets=sockets,
         consensus=consensus,
         vault=vault,
         metrics_curr=curr_metrics,
-        metrics_prev=prev_metrics,
+        metrics_prev=effective_prev_metrics,
         orconns=orconns,
         flood_threshold=args.flood_threshold,
         emit_nft_hints=args.emit_nft_hints,

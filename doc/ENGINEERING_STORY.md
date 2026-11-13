@@ -1,4 +1,4 @@
-# Engineering Story: Building, Breaking, and Hardening RelaySentry (`v0.1.0` -> `v0.3.1`)
+# Engineering Story: Building, Breaking, and Hardening RelaySentry (`v0.1.0` -> `v0.3.3-beta`)
 
 ## Why We Built This
 
@@ -74,4 +74,10 @@ Static and hostile audits catch logic bugs, **live kernel toolchains and real To
 4. **Kernels Without `CONFIG_NFT_CONNLIMIT`, `sbin` Paths & Active-Ban Persistence:**
    Minimal/container kernels lacking `nft_connlimit` aborted transactional `nft -f -` loads on `ct count over`; added `kernel_supports_nft_connlimit()` auto-detection, `--no-nft-connlimit`, `/usr/sbin` binary resolution when `$PATH` omits `sbin`, and remaining-TTL re-injection of unexpired bans across `nft` table re-syncs.
 
-**Practical takeaway:** `RelaySentry` isn't a replacement for upstream Tor C fixes—it's a hardened, battle-audited shield and forensic triage bridge designed to keep real relay operators online safely until the next upstream Tor mitigation lands cleanly across the network.
+---
+
+## Stage 6 — `v0.3.3-beta` Scope Freeze & Public Beta Release
+
+Rather than adding further unverified features, `v0.3.3-beta` freezes feature scope cleanly to prepare RelaySentry for real community operator testing: fixed the `--watch` Tick-1 `MetricsPort` cumulative counter false-alarm bug (establishing a baseline on Tick 1 so historical daemon counters do not trigger `ACTIVE_DOS_PRESSURE` on startup), synchronized `SECURITY.md` and `doc/THREAT_MODEL_AND_SPECS.md` with actual kernel/procfs/shield invariants, and documented the remaining production gaps (`BPF_MAP_TYPE_LPM_TRIE` CIDR XDP allowlists, native hardware NIC XDP validation, live IPv6 E2E traffic tests, and systemd/`debian-tor` packaging) openly in `README.md`.
+
+**Practical takeaway:** `RelaySentry` isn't a replacement for upstream Tor C fixes—it's a hardened, battle-audited beta shield and forensic triage bridge designed to keep real relay operators online safely until upstream Tor mitigations land across the network.

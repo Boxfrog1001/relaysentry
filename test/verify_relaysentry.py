@@ -2,9 +2,11 @@
 """Offline & loopback sandbox verification suite for RelaySentry."""
 
 import argparse
+import contextlib
 import gzip
 import hashlib
 import http.server
+import io
 import json
 import os
 import socket
@@ -1044,6 +1046,119 @@ def test_builtin_shield_controller_and_xdp_sync() -> None:
     print("  [PASS] Built-in ShieldController (nft/XDP), --emit-xdp-sync & dry-run CLI verified.")
 
 
+def test_watch_metrics_tick1_baseline() -> None:
+    print("[TEST 11] Verifying --watch Tick-1 MetricsPort cumulative counter baselining...")
+    scrape_count = 0
+
+    class StatefulMetricsHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            nonlocal scrape_count
+            scrape_count += 1
+            if scrape_count == 1:
+                ntor_drop = 25000
+                begindir_rej = 4200
+            else:
+                ntor_drop = 25050
+                begindir_rej = 4260
+            body = (
+                'tor_relay_connections{type="or",direction="initiated",state="opened",family="ipv4"} 120\n'
+                'tor_relay_load_onionskins_total{type="ntor",action="processed"} 500000\n'
+                f'tor_relay_load_onionskins_total{{type="ntor",action="dropped"}} {ntor_drop}\n'
+                "tor_relay_load_oom_bytes_total 67108864\n"
+                "tor_relay_load_socket_total 800\n"
+                f'tor_relay_dos_total{{type="begindir_rate_rejected"}} {begindir_rej}\n'
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), StatefulMetricsHandler)
+    m_port = httpd.server_address[1]
+    t_http = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t_http.start()
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cons_file = td_path / "cons.json"
+            cons_file.write_text(
+                json.dumps(
+                    {
+                        "relays": [
+                            {
+                                "nickname": "BaselinePeer",
+                                "fingerprint": "E" * 40,
+                                "running": True,
+                                "or_addresses": ["198.51.100.44:9001"],
+                                "flags": ["Guard", "Running", "Valid"],
+                                "as": "AS64599",
+                                "consensus_weight": 1000,
+                            }
+                        ]
+                    }
+                )
+            )
+            proc_file = td_path / "tcp"
+            proc_file.write_text(
+                "  sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+                f"   0: {_encode_ipv4_hex_le('203.0.113.5')}:2329 {_encode_ipv4_hex_le('198.51.100.44')}:AA01 01 00000000:00000000 00:00000000 0 105 0 1\n"
+            )
+            stdout_buf = io.StringIO()
+            stderr_buf = io.StringIO()
+            sleep_calls = 0
+
+            def stop_on_second_sleep(_interval):
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls >= 2:
+                    raise KeyboardInterrupt
+
+            with mock.patch("time.sleep", side_effect=stop_on_second_sleep):
+                with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+                    rc = cli_main(
+                        [
+                            "--port",
+                            "9001",
+                            "--consensus-file",
+                            str(cons_file),
+                            "--proc-tcp-file",
+                            str(proc_file),
+                            "--metrics-url",
+                            f"http://127.0.0.1:{m_port}/metrics",
+                            "--no-cache",
+                            "--watch",
+                            "1",
+                            "--json",
+                        ]
+                    )
+            assert rc == 0, f"Expected rc=0, got {rc}"
+            assert scrape_count == 2, f"Expected 2 scrapes, got {scrape_count}"
+            assert "Watch baseline established" in stderr_buf.getvalue()
+
+            decoder = json.JSONDecoder()
+            raw_out = stdout_buf.getvalue().lstrip()
+            rep1, idx = decoder.raw_decode(raw_out)
+            rep2, _ = decoder.raw_decode(raw_out[idx:].lstrip())
+
+            assert rep1["severity"] == "NORMAL", f"Tick 1 false alarm: {rep1}"
+            assert rep1["metrics_delta"]["onionskins_dropped_delta"] == 0
+            assert rep1["metrics_delta"]["oom_bytes_delta"] == 0
+            assert rep1["metrics_delta"]["begindir_rejected_delta"] == 0
+
+            assert rep2["severity"] == "ACTIVE_DOS_PRESSURE", f"Tick 2 missed delta: {rep2}"
+            assert rep2["metrics_delta"]["onionskins_dropped_delta"] == 50
+            assert rep2["metrics_delta"]["oom_bytes_delta"] == 0
+            assert rep2["metrics_delta"]["begindir_rejected_delta"] == 60
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    print("  [PASS] --watch Tick-1 MetricsPort cumulative counter baselining verified.")
+
+
 def main() -> int:
     print("=" * 74)
     print(" RELAYSENTRY PRIVACY, SPECIFICATION & SANDBOX VERIFICATION SUITE")
@@ -1058,8 +1173,9 @@ def main() -> int:
     test_adaptive_shield_xdp_entropy_and_stride()
     test_thunderstorm_and_unresponsive_metrics_resilience()
     test_builtin_shield_controller_and_xdp_sync()
+    test_watch_metrics_tick1_baseline()
     print("=" * 74)
-    print(" ALL 10 RELAYSENTRY BENCHMARK & PRIVACY SUITES PASSED (0 FAILURES)")
+    print(" ALL 11 RELAYSENTRY BENCHMARK & PRIVACY SUITES PASSED (0 FAILURES)")
     print("=" * 74)
     return 0
 

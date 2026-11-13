@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.3] - 2026-11-13
+### Fixed & Clarified (Public Beta Freeze)
+- **`--watch` Tick-1 `MetricsPort` baseline (`src/relaysentry.py`, `test/verify_relaysentry.py`):** Baselined cumulative Tor `MetricsPort` counters on the first successful `--watch` scrape instead of treating process-lifetime historical drops/OOM totals as an immediate Tick-1 interval spike; added `[TEST 11]` multi-tick regression test.
+- **Documentation & beta-scope alignment (`README.md`, `SECURITY.md`, `doc/THREAT_MODEL_AND_SPECS.md`, `doc/ENGINEERING_STORY.md`):** Corrected stale `TIME_WAIT`/`CLOSE_WAIT` and `0.1.x` references, documented active `--enforce-shield`/`nft`/`XDP` boundaries and `--metrics-url` single-shot vs `--watch` delta behavior, and added an explicit Experimental Beta / Help Wanted roadmap section.
+
 ## [0.3.2] - 2026-11-13
 ### Fixed (Real Linux 6.6 Kernel, XDP/bpftool & Live Chutney Tor 0.4.9.11 Verification)
 - **Microdesc Consensus `r` line parsing (`src/consensus_index.py`):** Supported 8-token `/var/lib/tor/cached-microdesc-consensus` router lines (which omit the descriptor digest token and store the relay IP at `parts[5]` rather than `parts[6]`), preventing real Tor `0.4.x` relays from silently dropping all consensus entries and exposing peer relays.
